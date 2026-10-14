@@ -1,0 +1,57 @@
+# Mosaic production values — k3s + Tailscale Funnel
+# Usage: helm install mosaic ./charts/mosaic -n mosaic --create-namespace -f values-prod.yaml
+
+replicaCount: 1
+
+image:
+  registry: localhost
+  repository: haven
+  tag: "4.10.0"
+  pullPolicy: IfNotPresent
+
+persistence:
+  enabled: true
+  accessMode: ReadWriteOnce
+  size: 5Gi
+  existingClaim: ""
+
+env:
+  PORT: "3000"
+  HOST: "0.0.0.0"
+  NODE_ENV: "production"
+  FORCE_HTTP: "true"   # plain HTTP inside the pod; TLS terminated by Tailscale Funnel
+  ADMIN_USERNAME: "j_kro"
+
+tailscale:
+  enabled: true
+  hostname: "mosaic"
+  funnel: true
+  serve: false
+
+ingress:
+  enabled: false
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Image entrypoint starts as root then su-execs to 'node'
+podSecurityContext:
+  runAsNonRoot: false
+  runAsUser: 0
+  fsGroup: 1000
+
+# Keep container default capability set (root needs CHOWN/SETUID/SETGID for su-exec)
+securityContext:
+  allowPrivilegeEscalation: true
+  capabilities:
+    drop: []
+    add: []
+
+# Pin to nexus (local image + local-path PV live there)
+nodeSelector:
+  kubernetes.io/hostname: nexus

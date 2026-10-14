@@ -1,0 +1,23 @@
+{{- if .Values.tailscale.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "mosaic.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mosaic.labels" . | nindent 4 }}
+  annotations:
+    {{- if .Values.tailscale.funnel }}
+    tailscale.com/funnel: "true"
+    {{- end }}
+spec:
+  ingressClassName: tailscale
+  defaultBackend:
+    service:
+      name: {{ include "mosaic.fullname" . }}
+      port:
+        number: {{ .Values.service.port }}
+  tls:
+    - hosts:
+        - {{ .Values.tailscale.hostname }}
+{{- end }}

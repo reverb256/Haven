@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mosaic.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "mosaic.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mosaic.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mosaic.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "mosaic.fullname" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+          {{- with .Values.env }}
+          env:
+            {{- range $name, $value := . }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          {{- if .Values.existingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: {{ .httpGet.path }}
+              port: {{ .httpGet.port }}
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: {{ .httpGet.path }}
+              port: {{ .httpGet.port }}
+            initialDelaySeconds: {{ .initialDelaySeconds }}
+            periodSeconds: {{ .periodSeconds }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.existingClaim }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim }}
+          {{- else if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "mosaic.fullname" . }}-data
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

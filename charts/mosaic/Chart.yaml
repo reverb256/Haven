@@ -1,0 +1,24 @@
+apiVersion: v2
+name: mosaic
+description: Mosaic — sovereign self-hosted social platform (Discord + MySpace + Federation). Built on Haven.
+type: application
+version: 0.1.0
+appVersion: "2.9.4"
+
+keywords:
+  - mosaic
+  - haven
+  - chat
+  - social
+  - federation
+  - self-hosted
+
+home: https://github.com/reverb256/Mosaic
+sources:
+  - https://github.com/reverb256/Mosaic
+
+maintainers:
+  - name: j_kro
+    email: j_kroeker@reverb256.ca
+
+dependencies: []

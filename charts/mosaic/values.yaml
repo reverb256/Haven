@@ -1,0 +1,116 @@
+# Mosaic Helm Chart Values
+# Usage:
+#   helm install mosaic ./charts/mosaic -n mosaic --create-namespace -f values-prod.yaml
+
+replicaCount: 1
+
+image:
+  registry: ghcr.io/reverb256
+  repository: mosaic
+  tag: latest
+  pullPolicy: Always
+
+nameOverride: ""
+fullnameOverride: ""
+
+# Data persistence
+persistence:
+  enabled: true
+  accessMode: ReadWriteOnce
+  size: 5Gi
+  storageClass: ""
+  existingClaim: ""
+
+# Application configuration
+env:
+  PORT: "3000"
+  HOST: "0.0.0.0"
+  NODE_ENV: "production"
+  # DATA_DIR: "/data"         # override if your image expects a different path
+  # SERVER_NAME: "My Mosaic"
+  # ADMIN_USERNAME: "admin"
+  # GIPHY_API_KEY: ""
+  # VAPID_EMAIL: "mailto:you@example.com"
+  # TURN_URL: "turn:your-server:3478"
+  # TURN_SECRET: "your-secret"
+
+# External secrets (VAPID keys, TURN creds, etc.) — set existingSecret to reference
+# a pre-created Secret containing key-value pairs merged into the pod env.
+existingSecret: ""
+
+# Ingress configuration
+ingress:
+  enabled: true
+  className: "nginx"
+  annotations: {}
+  hosts:
+    - host: mosaic.lan
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Tailscale Funnel (replaces ingress — exposes via Tailscale Funnel)
+# When enabled, the chart adds a tailscale.com/v1alpha1 ProxyClass/Proxy
+# and annotates the service for Funnel. Requires tailscale operator on the cluster.
+tailscale:
+  enabled: false
+  hostname: "mosaic"                # tailnet hostname (mosaic.tailnet-name.ts.net)
+  funnel: true                      # enable Funnel (public internet exposure)
+  serve: false                      # use Serve instead of Funnel (tailnet-only)
+  authKeySecret: ""                 # name of secret containing ts-authkey (optional; uses operator default if empty)
+  authKeySecretKey: "ts-authkey"    # key within that secret
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+# Health probes — Mosaic exposes /api/health
+livenessProbe:
+  httpGet:
+    path: /api/health
+    port: http
+  initialDelaySeconds: 15
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /api/health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+service:
+  type: ClusterIP
+  port: 3000
+  redirectPort: 3001
+
+# ServiceAccount
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# Pod security
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
