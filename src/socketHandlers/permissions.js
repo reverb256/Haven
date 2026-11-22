@@ -1,4 +1,18 @@
-// ── Permission system helpers (factory — closes over db) ──
+// ── Permission system helpers (factory, closes over db) ──
+const roleGate = require('../roleGate');
+const nameColor = require('../nameColor');
+const { parseRoleGate } = roleGate;
+
+// A failed read of the per-user overrides (user_role_perms) means an explicit
+// deny cannot be ruled out, so callers fail closed. The read runs on every
+// permission check, so the log line is limited to once a minute.
+let _overrideReadWarnedAt = 0;
+function warnOverrideRead(where, err) {
+  const now = Date.now();
+  if (now - _overrideReadWarnedAt < 60 * 1000) return;
+  _overrideReadWarnedAt = now;
+  console.error(`[permissions] ${where}: override read failed, denying:`, err && err.message);
+}
 
 module.exports = function createPermissions(db) {
 
@@ -43,34 +57,34 @@ module.exports = function createPermissions(db) {
     return level;
   }
 
-  function getPermissionThresholds() {
-    try {
-      const row = db.prepare("SELECT value FROM server_settings WHERE key = 'permission_thresholds'").get();
-      return row ? JSON.parse(row.value) : {};
-    } catch { return {}; }
-  }
-
   function userHasPermission(userId, permission, channelId = null) {
     const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(userId);
     if (user && user.is_admin) return true;
 
-    // Check per-user permission overrides first (explicit deny takes priority)
+    // Check per-user permission overrides first (explicit deny takes priority).
+    // (#5433) Overrides written by a channel-scoped role assignment carry that
+    // assignment's channel_id and must only apply within that channel (and its
+    // sub-channels, via the role chain). Rows with channel_id NULL come from
+    // server-wide assignments and apply everywhere. Previously this query had
+    // no channel filter, so ticking e.g. "create channel" on a channel
+    // assignment leaked the permission server-wide.
     try {
+      const chain = channelId ? getChannelRoleChain(channelId) : [];
+      const scopeClause = chain.length > 0
+        ? `(channel_id IS NULL OR channel_id IN (${chain.map(() => '?').join(',')}))`
+        : 'channel_id IS NULL';
       const override = db.prepare(`
-        SELECT allowed FROM user_role_perms WHERE user_id = ? AND permission = ?
+        SELECT allowed FROM user_role_perms WHERE user_id = ? AND permission = ? AND ${scopeClause}
         ORDER BY allowed ASC LIMIT 1
-      `).get(userId, permission);
+      `).get(userId, permission, ...chain);
       if (override) {
         if (override.allowed === 0) return false;
         if (override.allowed === 1) return true;
       }
-    } catch { /* table may not exist yet */ }
-
-    // Check level-based permission thresholds
-    const thresholds = getPermissionThresholds();
-    if (thresholds[permission]) {
-      const level = getUserEffectiveLevel(userId);
-      if (level >= thresholds[permission]) return true;
+    } catch (err) {
+      // Fail closed: carrying on to the role checks would ignore a deny.
+      warnOverrideRead('userHasPermission', err);
+      return false;
     }
 
     // Check server-scoped roles
@@ -124,19 +138,62 @@ module.exports = function createPermissions(db) {
           if (idx !== -1) perms.splice(idx, 1);
         }
       }
-    } catch { /* user_role_perms table may not exist yet */ }
-
-    const thresholds = getPermissionThresholds();
-    const level = getUserEffectiveLevel(userId);
-    for (const [perm, minLevel] of Object.entries(thresholds)) {
-      if (level >= minLevel && !perms.includes(perm)) perms.push(perm);
+    } catch (err) {
+      // Fail closed: role perms without their deny overrides could over-grant,
+      // and callers use this list to decide what someone may hand out.
+      warnOverrideRead('permission list', err);
+      return [];
     }
+
+    return perms;
+  }
+
+  // (#5433 follow-up) Global-only variant of getUserPermissions, for gating
+  // UI that performs a server-wide action regardless of which channel is
+  // active (e.g. the sidebar "Create Channel" section, which always creates
+  // a top-level channel). getUserPermissions() flattens server-wide AND
+  // channel-scoped grants together for per-channel UI (context menus opened
+  // for a specific channel), which is correct there, but that same flat
+  // list also made the always-visible sidebar button appear for users who
+  // only held create_channel in one sub-channel, a dead control since every
+  // click would be denied server-side. This variant excludes any
+  // channel-scoped role assignment or override (channel_id IS NULL only).
+  function getUserGlobalPermissions(userId) {
+    const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(userId);
+    if (user && user.is_admin) return ['*'];
+    const rows = db.prepare(`
+      SELECT DISTINCT rp.permission FROM role_permissions rp
+      JOIN roles r ON rp.role_id = r.id
+      JOIN user_roles ur ON r.id = ur.role_id
+      WHERE ur.user_id = ? AND rp.allowed = 1 AND ur.channel_id IS NULL
+    `).all(userId);
+    const perms = rows.map(r => r.permission);
+
+    try {
+      const overrides = db.prepare(`
+        SELECT permission, allowed FROM user_role_perms WHERE user_id = ? AND channel_id IS NULL
+      `).all(userId);
+      for (const ov of overrides) {
+        if (ov.allowed === 1 && !perms.includes(ov.permission)) {
+          perms.push(ov.permission);
+        } else if (ov.allowed === 0) {
+          const idx = perms.indexOf(ov.permission);
+          if (idx !== -1) perms.splice(idx, 1);
+        }
+      }
+    } catch (err) {
+      // Fail closed: role perms without their deny overrides could over-grant,
+      // and callers use this list to decide what someone may hand out.
+      warnOverrideRead('permission list', err);
+      return [];
+    }
+
     return perms;
   }
 
   function getUserRoles(userId) {
     return db.prepare(`
-      SELECT r.id, r.name, r.level, r.scope, r.color, ur.channel_id
+      SELECT r.id, r.name, r.level, r.scope, r.color, r.color2, r.color_shimmer, ur.channel_id
       FROM roles r
       JOIN user_roles ur ON r.id = ur.role_id
       WHERE ur.user_id = ?
@@ -145,9 +202,12 @@ module.exports = function createPermissions(db) {
     `).all(userId);
   }
 
+  // The role that styles the user: the highest one that is not transparent.
+  // The highest role that shows. Its colors are those of the role the person
+  // picked for their name, when they picked one (src/nameColor.js).
   function getUserHighestRole(userId, channelId = null) {
-    const all = getUserAllRoles(userId, channelId);
-    return all.length > 0 ? all[0] : null;
+    const roles = getUserAllRoles(userId, channelId);
+    return nameColor.withNameColor(db, userId, roles.find(r => !r.transparent) || null, roles);
   }
 
   // Returns every role that applies to `userId` in `channelId`'s context:
@@ -156,19 +216,14 @@ module.exports = function createPermissions(db) {
   // { id, name, level, color, icon, scope, channel_id }. Used for multi-role
   // display so the member tooltip / chat hover can list all roles a user holds.
   function getUserAllRoles(userId, channelId = null) {
-    const user = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(userId);
-    if (user && user.is_admin) {
-      return [{ id: 0, name: 'Admin', level: 100, color: '#e74c3c', icon: null, scope: 'server', channel_id: null }];
-    }
-
-    // Dedupe by role.id for display purposes — if a user holds the same
+    // Dedupe by role.id for display purposes: if a user holds the same
     // role in multiple channels (or both server-wide and a channel), we
     // surface it once with the highest effective level. Channel scope is
     // not meaningful in chat/tooltip/profile-card surfaces; permission
     // checks use getUserEffectiveLevel/getUserPermissions, which correctly
     // walk every assignment row independently. (Without this dedupe,
     // hover cards rendered "Channel Mod Channel Mod" for users who held
-    // the same role in two channels — issue raised on experimental/multi-role.)
+    // the same role in two channels; issue raised on experimental/multi-role.)
     const byId = new Map();
     const consider = (r) => {
       const existing = byId.get(r.id);
@@ -177,7 +232,7 @@ module.exports = function createPermissions(db) {
 
     const serverRows = db.prepare(`
       SELECT r.id, r.name, COALESCE(ur.custom_level, r.level) as level,
-             r.color, r.icon, r.scope, ur.channel_id
+             r.color, r.color2, r.color_shimmer, r.icon, r.transparent, r.scope, ur.channel_id
       FROM roles r JOIN user_roles ur ON r.id = ur.role_id
       WHERE ur.user_id = ? AND ur.channel_id IS NULL
     `).all(userId);
@@ -189,7 +244,7 @@ module.exports = function createPermissions(db) {
         const placeholders = chain.map(() => '?').join(',');
         const chRows = db.prepare(`
           SELECT r.id, r.name, COALESCE(ur.custom_level, r.level) as level,
-                 r.color, r.icon, r.scope, ur.channel_id
+                 r.color, r.color2, r.color_shimmer, r.icon, r.transparent, r.scope, ur.channel_id
           FROM roles r JOIN user_roles ur ON r.id = ur.role_id
           WHERE ur.user_id = ? AND ur.channel_id IN (${placeholders})
         `).all(userId, ...chain);
@@ -198,13 +253,73 @@ module.exports = function createPermissions(db) {
     }
 
     const out = Array.from(byId.values());
+    // These rows ride on every member list entry, so a role without a
+    // gradient leaves the gradient fields out instead of sending empty ones.
+    for (const r of out) {
+      if (!r.color2) { delete r.color2; delete r.color_shimmer; }
+    }
     out.sort((a, b) => (b.level || 0) - (a.level || 0));
     return out;
   }
 
+  // ── Role gate ───────────────────────────────────────────
+  // The rule itself lives in src/roleGate.js so bot code shares it.
+  function roleGateAllows(userId, channel) {
+    return roleGate.roleGateAllows(db, userId, channel);
+  }
+
+  // ── Required roles are membership (#5649) ───────────────
+  // Whoever passes a channel's gate is a member of it; a row the gate added
+  // goes away when they stop passing. Rows added by hand are left alone (the
+  // gate still hides the channel from them while they lack the roles).
+  // Returns the rows that changed, so the socket layer can move people in
+  // and out of the rooms. Pass channelId or userId to narrow it.
+  function syncRoleGateMemberships({ channelId = null, userId = null } = {}) {
+    const chans = channelId
+      ? db.prepare('SELECT id, code, role_gate FROM channels WHERE id = ? AND is_dm = 0').all(channelId)
+      : db.prepare('SELECT id, code, role_gate FROM channels WHERE role_gate IS NOT NULL AND is_dm = 0').all();
+    if (!chans.length) return [];
+    const users = userId
+      ? db.prepare('SELECT id, is_admin FROM users WHERE id = ?').all(userId)
+      : db.prepare('SELECT id, is_admin FROM users').all();
+    const ins = db.prepare('INSERT OR IGNORE INTO channel_members (channel_id, user_id, via_role_gate) VALUES (?, ?, 1)');
+    const del = db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ? AND via_role_gate = 1');
+    const changes = [];
+    const run = db.transaction(() => {
+      for (const ch of chans) {
+        const gate = parseRoleGate(ch.role_gate);
+        for (const u of users) {
+          if (u.is_admin) continue;
+          if (gate && roleGateAllows(u.id, ch)) {
+            if (ins.run(ch.id, u.id).changes) changes.push({ userId: u.id, channelId: ch.id, code: ch.code, joined: true });
+          } else if (del.run(ch.id, u.id).changes) {
+            changes.push({ userId: u.id, channelId: ch.id, code: ch.code, joined: false });
+          }
+        }
+      }
+    });
+    run();
+    return changes;
+  }
+
+  // ── Per-role upload cap ─────────────────────────────────
+  // The server-wide max_upload_mb is the floor for everyone; a role can raise
+  // it for its holders, and the highest cap among a user's roles wins.
+  function getUserUploadMb(userId) {
+    const base = parseInt(db.prepare("SELECT value FROM server_settings WHERE key = 'max_upload_mb'").get()?.value, 10) || 25;
+    const row = db.prepare(`
+      SELECT MAX(r.max_upload_mb) AS cap FROM roles r
+      JOIN user_roles ur ON ur.role_id = r.id
+      WHERE ur.user_id = ? AND ur.channel_id IS NULL AND r.max_upload_mb IS NOT NULL
+    `).get(userId);
+    const cap = row && row.cap ? parseInt(row.cap, 10) : 0;
+    return Math.max(base, cap || 0);
+  }
+
   return {
-    getChannelRoleChain, getUserEffectiveLevel, getPermissionThresholds,
-    userHasPermission, getUserPermissions, getUserRoles,
-    getUserHighestRole, getUserAllRoles
+    getChannelRoleChain, getUserEffectiveLevel,
+    userHasPermission, getUserPermissions, getUserGlobalPermissions, getUserRoles,
+    getUserHighestRole, getUserAllRoles,
+    parseRoleGate, roleGateAllows, getUserUploadMb, syncRoleGateMemberships
   };
 };

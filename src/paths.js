@@ -1,9 +1,9 @@
 /**
- * Haven — Centralised data-directory resolution
+ * Haven: Centralised data-directory resolution
  *
  * All user data (database, .env, certs, uploads) lives OUTSIDE the
  * application folder so the code directory can never accidentally
- * leak personal data — even if someone copies the whole folder,
+ * leak personal data, even if someone copies the whole folder,
  * force-adds files, or pushes to a public repo.
  *
  * Locations:
@@ -47,11 +47,22 @@ const CERTS_DIR    = path.join(DATA_DIR, 'certs');
 const UPLOADS_DIR  = path.join(DATA_DIR, 'uploads');
 
 const DELETED_ATTACHMENTS_DIR = path.join(UPLOADS_DIR, 'deleted-attachments');
+// Downloaded Flash games live with the rest of the server's data, so they
+// survive updates (in Docker the app folder is replaced on every update).
+const GAMES_ROMS_DIR = path.join(DATA_DIR, 'games', 'roms');
+// Uploads land here first and only move into uploads/ once their location
+// data is gone (src/privacyPass.js). Outside uploads/, so nothing here is served.
+const UNPROCESSED_DIR = path.join(DATA_DIR, 'unprocessed');
+// A cleaned upload waits here while its route checks it, and only reaches
+// storage once the route admits it (src/storage).
+const STAGING_DIR = path.join(UNPROCESSED_DIR, 'staging');
 
 // Ensure sub-directories exist
 fs.mkdirSync(CERTS_DIR,                { recursive: true });
 fs.mkdirSync(UPLOADS_DIR,             { recursive: true });
 fs.mkdirSync(DELETED_ATTACHMENTS_DIR, { recursive: true });
+fs.mkdirSync(UNPROCESSED_DIR,         { recursive: true });
+fs.mkdirSync(STAGING_DIR,             { recursive: true });
 
 // ── One-time migration: move data from old project-dir locations ─────
 const PROJECT_ROOT = path.join(__dirname, '..');
@@ -63,7 +74,10 @@ function migrateFile(oldRel, newAbs) {
       fs.copyFileSync(oldAbs, newAbs);
       fs.unlinkSync(oldAbs);
       console.log(`📦 Migrated ${oldRel} → ${newAbs}`);
-    } catch { /* silent — might lack permissions */ }
+    } catch (err) {
+      // Left behind, the server would start on an empty file in the new location.
+      console.warn(`⚠️  Could not migrate ${oldRel} to ${newAbs}:`, err.message);
+    }
   }
 }
 
@@ -82,7 +96,9 @@ function migrateDir(oldRel, newDir) {
           console.log(`📦 Migrated ${oldRel}/${entry} → ${dst}`);
         }
       }
-    } catch { /* silent */ }
+    } catch (err) {
+      console.warn(`⚠️  Could not migrate ${oldRel} to ${newDir}:`, err.message);
+    }
   }
 }
 
@@ -93,4 +109,4 @@ migrateFile('.env',           ENV_PATH);
 migrateDir('certs',           CERTS_DIR);
 migrateDir('public/uploads',  UPLOADS_DIR);
 
-module.exports = { getDataDir, DATA_DIR, DB_PATH, ENV_PATH, CERTS_DIR, UPLOADS_DIR, DELETED_ATTACHMENTS_DIR };
+module.exports = { getDataDir, DATA_DIR, DB_PATH, ENV_PATH, CERTS_DIR, UPLOADS_DIR, DELETED_ATTACHMENTS_DIR, GAMES_ROMS_DIR, UNPROCESSED_DIR, STAGING_DIR };

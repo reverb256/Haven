@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════
-// Haven — Notification Tone System (Web Audio API + Audio Files)
-// Zero dependencies — generates tones programmatically,
+// Haven: Notification Tone System (Web Audio API + Audio Files)
+// Zero dependencies: generates tones programmatically,
 // plays AIM-style sounds & custom uploaded audio files
 // ═══════════════════════════════════════════════════════════
 
@@ -9,16 +9,24 @@ class NotificationManager {
     this.audioCtx = null;
     this.enabled = this._loadPref('haven_notif_enabled', false);
     this.mentionsEnabled = this._loadPref('haven_notif_mentions_enabled', true);
+    this.roleMentionsEnabled = this._loadPref('haven_notif_role_mentions_enabled', true); // @Role pings (#5579)
     this.repliesEnabled = this._loadPref('haven_notif_replies_enabled', true);
     this.dmEnabled = this._loadPref('haven_notif_dm_enabled', true);
     this.voiceActionCuesEnabled = this._loadPref('haven_notif_voice_action_cues_enabled', true);
+    // Opt-in rate limit for visible notification pop-ups (default 0 = off).
+    this.popupCooldownMs = this._loadPref('haven_notif_popup_cooldown_ms', 0);
+    this._lastPopupAt = 0;
     this.volume = this._loadPref('haven_notif_volume', 0.5);
+    // One level over every sound, applied on top of each sound's own volume.
+    this.master = this._loadPref('haven_notif_master_volume', 1);
     this.mentionVolume = this._loadPref('haven_notif_mention_volume', 0.8);
     this.replyVolume = this._loadPref('haven_notif_reply_volume', 0.8);
     this.joinVolume = this._loadPref('haven_notif_join_volume', 0.8);
     this.leaveVolume = this._loadPref('haven_notif_leave_volume', 0.8);
     this.sounds = {
-      message: this._loadPref('haven_notif_msg_sound', 'ping'),
+      // A pick saved before #5757 went under the 'message' key, which nothing
+      // read back; it still counts until a new pick is saved.
+      message: this._loadPref('haven_notif_msg_sound', this._loadPref('haven_notif_message_sound', 'ping')),
       sent: this._loadPref('haven_notif_sent_sound', 'swoosh'),
       mention: this._loadPref('haven_notif_mention_sound', 'bell'),
       reply: this._loadPref('haven_notif_reply_sound', 'chime'),
@@ -38,6 +46,17 @@ class NotificationManager {
     return isNaN(n) ? v : n;
   }
 
+  // The level a sound plays at: its own volume times the master volume.
+  _level() {
+    const m = typeof this.master === 'number' ? this.master : 1;
+    return Math.max(0, Math.min(1, this.volume * m));
+  }
+
+  setMasterVolume(val) {
+    this.master = Math.max(0, Math.min(1, val));
+    this._savePref('haven_notif_master_volume', this.master);
+  }
+
   _savePref(key, value) {
     localStorage.setItem(key, String(value));
   }
@@ -53,7 +72,7 @@ class NotificationManager {
   // ── Synth Tone Engine ───────────────────────────────────
 
   _playTone(frequencies, durations, type = 'sine') {
-    if (this.volume <= 0) return;
+    if (this._level() <= 0) return;
     try {
       const ctx = this._getCtx();
       const masterGain = ctx.createGain();
@@ -69,7 +88,7 @@ class NotificationManager {
         gain.connect(masterGain);
 
         const dur = durations[i] || 0.15;
-        const vol = this.volume * this.volume; // exponential curve for natural feel
+        const vol = this._level() * this._level(); // exponential curve for natural feel
         gain.gain.setValueAtTime(Math.max(vol, 0.001), time);
         gain.gain.exponentialRampToValueAtTime(0.001, time + dur);
         osc.start(time);
@@ -88,8 +107,8 @@ class NotificationManager {
   bell()  { this._playTone([1047, 1319, 1568], [0.15, 0.15, 0.25], 'sine'); }
   alert() { this._playTone([880, 1100, 880, 1100], [0.08, 0.08, 0.08, 0.12], 'sine'); }
   chord() { this._playTone([523, 659, 784, 1047], [0.1, 0.08, 0.08, 0.2], 'sine'); }
-  swoosh(){ this._playTone([400, 600, 800], [0.04, 0.04, 0.06], 'sine'); }  // soft ascending — "sent"
-  announcement() { this._playTone([523, 659, 784, 1047], [0.12, 0.1, 0.1, 0.25], 'sine'); } // bright ascending chord — announcement
+  swoosh(){ this._playTone([400, 600, 800], [0.04, 0.04, 0.06], 'sine'); }  // soft ascending: "sent"
+  announcement() { this._playTone([523, 659, 784, 1047], [0.12, 0.1, 0.1, 0.25], 'sine'); } // bright ascending chord: announcement
 
   // ── Voice action cues (always play at current volume) ───
   mute_on()  { this._playTone([600, 400], [0.06, 0.08], 'sine'); }
@@ -103,16 +122,16 @@ class NotificationManager {
   // ── Custom Sound File Playback ──────────────────────────
 
   _playFile(url) {
-    if (this.volume <= 0) return;
+    if (this._level() <= 0) return;
     try {
       let audio = this._audioCache[url];
       if (!audio) {
         audio = new Audio(url);
         this._audioCache[url] = audio;
       }
-      audio.volume = Math.max(0, Math.min(1, this.volume * this.volume));
+      audio.volume = Math.max(0, Math.min(1, this._level() * this._level()));
       audio.currentTime = 0;
-      audio.play().catch(() => {});
+      audio.play().catch(() => { /* autoplay blocked until the next click; nothing to recover */ });
     } catch { /* audio not available */ }
   }
 
@@ -130,7 +149,7 @@ class NotificationManager {
       // Strip @mentions so TTS doesn't read "at username"
       cleaned = cleaned.replace(/@(\w+)/g, '$1');
       const utter = new SpeechSynthesisUtterance(cleaned);
-      utter.volume = Math.max(0, Math.min(1, this.volume));
+      utter.volume = this._level();
       utter.rate = 1;
       utter.pitch = 1;
       speechSynthesis.speak(utter);
@@ -144,13 +163,15 @@ class NotificationManager {
   // ── Public API ──────────────────────────────────────────
 
   play(event, opts) {
+    if (event !== 'sent' && window.app?.userStatus === 'dnd' && !(opts && opts.preview)) return;
     // Per-type opt-in: mentions, replies, DMs bypass master toggle if their own toggle is on
     if (opts && opts.isMention && this.mentionsEnabled) { /* allowed */ }
     else if (opts && opts.isReply && this.repliesEnabled) { /* allowed */ }
     else if (opts && opts.isDm && this.dmEnabled) { /* allowed */ }
     // Regular message & announcement sounds are gated by the master toggle;
-    // everything else (sent, join, leave) always plays
-    else if ((event === 'message' || event === 'announcement') && !this.enabled) return;
+    // everything else (sent, join, leave) always plays. A settings preview
+    // skips the gate: picking a sound should let you hear it either way.
+    else if ((event === 'message' || event === 'announcement') && !this.enabled && !(opts && opts.preview)) return;
 
     const sound = this.sounds[event];
     if (!sound || sound === 'none') return;
@@ -197,7 +218,7 @@ class NotificationManager {
 
   /** Play a named tone directly (bypasses event→sound mapping). Used for UI cues. */
   playDirect(toneName) {
-    if (this.volume <= 0) return;
+    if (this._level() <= 0) return;
     if (/^(mute|deafen)_(on|off)$/.test(toneName) && !this.voiceActionCuesEnabled) return;
     if (typeof this[toneName] === 'function') this[toneName]();
   }
@@ -210,6 +231,31 @@ class NotificationManager {
   setVoiceActionCuesEnabled(val) {
     this.voiceActionCuesEnabled = !!val;
     this._savePref('haven_notif_voice_action_cues_enabled', this.voiceActionCuesEnabled);
+  }
+
+  // 0 shows every pop-up, -1 shows none (sounds and badges are separate), any
+  // other value is the shortest gap between two pop-ups in ms (#5619).
+  setPopupCooldownMs(val) {
+    const n = parseInt(val, 10);
+    this.popupCooldownMs = n === -1 ? -1 : Math.max(0, n || 0);
+    this._savePref('haven_notif_popup_cooldown_ms', this.popupCooldownMs);
+  }
+
+  /**
+   * Rate-limit gate for VISIBLE notification pop-ups (Desktop OS banners and
+   * browser Notifications). Returns true if a pop-up may show right now, or
+   * false if we're still inside the user's chosen cooldown window. Off (0)
+   * always allows. Sounds and unread badges do NOT pass through this; only the
+   * visible pop-up is throttled, so a burst of activity (or a flaky connection
+   * that keeps reconnecting) can't spam the taskbar.
+   */
+  popupAllowed() {
+    if (this.popupCooldownMs === -1) return false;
+    if (!this.popupCooldownMs) return true;
+    const now = Date.now();
+    if (now - this._lastPopupAt < this.popupCooldownMs) return false;
+    this._lastPopupAt = now;
+    return true;
   }
 
   setVolume(val) {
@@ -239,6 +285,9 @@ class NotificationManager {
 
   setSound(event, sound) {
     this.sounds[event] = sound;
-    this._savePref(`haven_notif_${event}_sound`, sound);
+    // The message preference predates the event-name mapping and uses `msg`
+    // in storage. Keep that key aligned with the constructor's load path.
+    const prefEvent = event === 'message' ? 'msg' : event;
+    this._savePref(`haven_notif_${prefEvent}_sound`, sound);
   }
 }

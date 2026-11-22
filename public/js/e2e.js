@@ -1,5 +1,5 @@
 /**
- * Haven — End-to-End Encryption for DMs (v3 — True E2E)
+ * Haven: End-to-End Encryption for DMs (v3, True E2E)
  *
  * Crypto: ECDH P-256 key agreement → HKDF-SHA256 → AES-256-GCM
  *
@@ -7,7 +7,7 @@
  *   - Each user has an ECDH key pair generated in the browser.
  *   - The private key is wrapped (PBKDF2 + AES-GCM) with a key derived
  *     from the user's PASSWORD (never sent to the server as a wrapping key).
- *   - The server stores only the encrypted blob — it cannot decrypt.
+ *   - The server stores only the encrypted blob; it cannot decrypt.
  *   - Local IndexedDB caches the key pair for fast startup.
  *   - On login the password is available → wrapping key is derived client-side.
  *   - On auto-login (JWT, no password) IndexedDB provides the cached key pair.
@@ -40,7 +40,7 @@ class HavenE2E {
 
   /**
    * Derive a wrapping key from the user's password.
-   * This is a one-way derivation — password cannot be recovered from the result.
+   * This is a one-way derivation: password cannot be recovered from the result.
    * Uses PBKDF2 with a fixed domain-separation salt (the final wrap adds a random salt).
    * @param  {string} password - The user's plaintext password
    * @return {Promise<string>} 64-char hex string
@@ -72,14 +72,14 @@ class HavenE2E {
       this._divergent = false;              // local pub != server pub
       this._ghostState = false;             // init aborted to protect a possibly-good server backup
 
-      /* 1. Fast path — local IndexedDB */
+      /* 1. Fast path: local IndexedDB */
       this._keyPair = await this._loadLocal();
 
       /* 1b. If loaded from IndexedDB, probe server state explicitly.
        *     Three outcomes:
-       *       present — verify local pub matches server pub; flag divergence if not
-       *       none    — server actually has no backup; re-upload ours
-       *       unknown — request timed out; do NOT mutate server state */
+       *       present: verify local pub matches server pub; flag divergence if not
+       *       none:    server actually has no backup; re-upload ours
+       *       unknown: request timed out; do NOT mutate server state */
       if (this._keyPair && socket && wrappingKey) {
         const probe = await this._fetchBackupWithState(socket);
         this._serverBackupState = probe.status;
@@ -89,21 +89,21 @@ class HavenE2E {
             const localPub = await crypto.subtle.exportKey('jwk', this._keyPair.publicKey);
             if (probe.serverPublicKey && localPub && probe.serverPublicKey.x && localPub.x && probe.serverPublicKey.x !== localPub.x) {
               this._divergent = true;
-              console.warn('[E2E] Local key diverges from server backup — awaiting user action');
+              console.warn('[E2E] Local key diverges from server backup, awaiting user action');
             }
           } catch { /* best-effort divergence check */ }
         } else if (probe.status === 'none') {
-          // Server confirmed empty — safe to re-upload our local key
+          // Server confirmed empty, so safe to re-upload our local key
           try { await this._uploadBackup(socket, wrappingKey); this._serverBackupExists = true; }
           catch (err) { console.warn('[E2E] Re-upload after recovery failed:', err.message); }
         } else {
-          // probe.status === 'unknown' — flaky network. Do NOT upload; it would
+          // probe.status === 'unknown': flaky network. Do NOT upload; it would
           // clobber whatever the server actually has.
-          console.warn('[E2E] Could not reach server for backup probe — skipping re-upload to avoid clobber');
+          console.warn('[E2E] Could not reach server for backup probe, skipping re-upload to avoid clobber');
         }
       }
 
-      /* 2. Cross-device — try server backup (only if we have a wrapping key) */
+      /* 2. Cross-device: try server backup (only if we have a wrapping key) */
       if (!this._keyPair && socket && wrappingKey) {
         const restored = await this._restoreFromServerWithState(socket, wrappingKey);
         this._keyPair = restored.pair;
@@ -111,7 +111,7 @@ class HavenE2E {
         if (restored.status === 'present') this._serverBackupExists = true;
       }
 
-      /* 3. No key anywhere — generate ONLY if we affirmatively confirmed the
+      /* 3. No key anywhere: generate ONLY if we affirmatively confirmed the
        *    server has no backup. On 'unknown' we bail out entirely: generating
        *    a fresh key here and uploading would clobber a potentially-good
        *    backup once the network comes back. A 5-min cooldown prevents
@@ -119,13 +119,13 @@ class HavenE2E {
       if (!this._keyPair && wrappingKey) {
         if (this._serverBackupState !== 'none') {
           this._ghostState = true;
-          console.warn('[E2E] Server state ' + this._serverBackupState + ' — refusing to generate keys (would risk clobber)');
+          console.warn('[E2E] Server state ' + this._serverBackupState + ': refusing to generate keys (would risk clobber)');
           this._ready = false;
           return false;
         }
         if (!(await this._canAttemptGenerate())) {
           this._ghostState = true;
-          console.warn('[E2E] Regenerate cooldown active — refusing to mint new keypair');
+          console.warn('[E2E] Regenerate cooldown active, refusing to mint new keypair');
           this._ready = false;
           return false;
         }
@@ -136,12 +136,12 @@ class HavenE2E {
         console.log('[E2E] Generated new key pair (first-time setup, server confirmed empty)');
       }
 
-      /* 4. Auto-login without IndexedDB — E2E unavailable until real login */
+      /* 4. Auto-login without IndexedDB: E2E unavailable until real login */
       if (!this._keyPair) {
         if (this._serverBackupExists) {
-          console.warn('[E2E] Server backup exists but could not be decrypted — password may be wrong');
+          console.warn('[E2E] Server backup exists but could not be decrypted; password may be wrong');
         } else {
-          console.warn('[E2E] No key pair available — login with password to unlock E2E');
+          console.warn('[E2E] No key pair available. Login with password to unlock E2E');
         }
         this._ready = false;
         return false;
@@ -151,7 +151,7 @@ class HavenE2E {
 
       /* Upload encrypted backup so other devices can sync.
        * Only upload when we just GENERATED a new key (first-time setup).
-       * Do NOT upload when loaded from IndexedDB — the server backup may
+       * Do NOT upload when loaded from IndexedDB: the server backup may
        * contain a NEWER key from another device, and overwriting it would
        * break cross-device sync and cause infinite conflict loops. */
       if (socket && wrappingKey && this._freshlyGenerated) {
@@ -187,6 +187,7 @@ class HavenE2E {
     if (!wrappingKey) return false;
     try {
       this._sharedKeys = {};
+      this._signingPair = null;
       this._keyPair = await this._generate();
       await this._saveLocal(this._keyPair);
       this._publicKeyJwk = await crypto.subtle.exportKey('jwk', this._keyPair.publicKey);
@@ -203,11 +204,13 @@ class HavenE2E {
 
   /**
    * Re-wrap and upload the private key with a new wrapping key.
-   * Call after password change (derive new key from new password).
+   * Call after password change (derive new key from new password), or with
+   * { separatePassphrase } when switching between the login password and a
+   * passphrase of the user's own.
    */
-  async reWrapKey(socket, newWrappingKey) {
+  async reWrapKey(socket, newWrappingKey, extra = {}) {
     if (!this._ready || !this._keyPair) return;
-    await this._uploadBackup(socket, newWrappingKey);
+    await this._uploadBackup(socket, newWrappingKey, extra);
   }
 
   /**
@@ -292,7 +295,7 @@ class HavenE2E {
     const sorted = [myJwk, theirJwk].sort((a, b) => (a.x < b.x ? -1 : a.x > b.x ? 1 : 0));
     // Normalize to only the essential fields in a fixed order so that local keys
     // (which may carry 'ext', 'key_ops', etc.) and server-fetched keys (plain JSON)
-    // produce identical strings — and therefore identical safety numbers.
+    // produce identical strings, and therefore identical safety numbers.
     const normalize = jwk => ({ kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y });
     const data = new TextEncoder().encode(JSON.stringify(normalize(sorted[0])) + JSON.stringify(normalize(sorted[1])));
     const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
@@ -407,9 +410,9 @@ class HavenE2E {
   /**
    * Fetch encrypted key backup with explicit status tracking.
    * Returns { status, data, serverPublicKey }:
-   *   status = 'present' — server returned a backup blob
-   *   status = 'none'    — server confirmed there is no backup (safe to generate)
-   *   status = 'unknown' — request timed out or errored (do NOT treat as empty)
+   *   status = 'present': server returned a backup blob
+   *   status = 'none':    server confirmed there is no backup (safe to generate)
+   *   status = 'unknown': request timed out or errored (do NOT treat as empty)
    * Retries once before giving up, so transient network blips aren't treated as "no backup".
    * This distinction is load-bearing: the previous 5s-timeout-returns-null design
    * conflated "confirmed empty" with "unreachable", which could let the client
@@ -439,7 +442,7 @@ class HavenE2E {
         } else if (data && data.state === 'empty') {
           resolve({ status: 'none', data: null, serverPublicKey: null });
         } else {
-          // Legacy server returned null blob but has a public key — ambiguous.
+          // Legacy server returned null blob but has a public key: ambiguous.
           // Treat as unknown to be safe; we'd rather retry than risk a clobber.
           resolve({ status: 'unknown', data: null, serverPublicKey: null });
         }
@@ -453,12 +456,12 @@ class HavenE2E {
     });
   }
 
-  async _uploadBackup(socket, secret) {
+  async _uploadBackup(socket, secret, extra = {}) {
     const { encryptedKey, salt } = await this._wrap(secret);
     return new Promise((resolve, reject) => {
       const t = setTimeout(() => reject(new Error('Upload timeout')), 5000);
       socket.once('encrypted-key-stored', () => { clearTimeout(t); resolve(); });
-      socket.emit('store-encrypted-key', { encryptedKey, salt });
+      socket.emit('store-encrypted-key', { encryptedKey, salt, ...extra });
     });
   }
 
@@ -473,17 +476,18 @@ class HavenE2E {
       socket.once('public-key-published', () => {
         clearTimeout(t);
         resolve({ ok: true, conflict: false });
+        this.initSigning(socket).catch(err => console.warn('[E2E] Signing key setup failed:', err.message));
       });
       socket.once('public-key-conflict', (data) => {
         clearTimeout(t);
         if (force) {
-          // Explicit key reset — overwrite server key
+          // Explicit key reset: overwrite server key
           socket.emit('publish-public-key', { jwk: this._publicKeyJwk, force: true });
           resolve({ ok: true, conflict: false });
         } else {
-          // Server has a different key — don't auto-overwrite.
+          // Server has a different key, so don't auto-overwrite.
           // Return conflict so the caller can decide (sync from server, prompt user, etc.)
-          console.warn('[E2E] Public key conflict — server has a different key');
+          console.warn('[E2E] Public key conflict: server has a different key');
           resolve({ ok: false, conflict: true, serverKey: data?.existing || null });
         }
       });
@@ -495,6 +499,99 @@ class HavenE2E {
    * Request a partner's public key from the server.
    * Returns a promise that resolves with the JWK or null.
    */
+  pairKey(partnerId, partnerJwk) {
+    return this._deriveShared(partnerId, partnerJwk);
+  }
+  get signingPrivateKey() { return this._signingPair ? this._signingPair.privateKey : null; }
+  get signingPublicJwk() { return this._signingPublicJwk || null; }
+  async _signingWrapKey() {
+    const jwk = await crypto.subtle.exportKey('jwk', this._keyPair.privateKey);
+    const d = this._fromB64(jwk.d.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((jwk.d.length + 3) % 4));
+    const ikm = await crypto.subtle.importKey('raw', d, 'HKDF', false, ['deriveKey']);
+    d.fill(0);
+    return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('haven-signing-backup-v1'), info: new TextEncoder().encode('aes-gcm-key') }, ikm, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  /**
+   * Emit and wait for the first of `resultEvents`. Resolves { event, data },
+   * or null on timeout. A request with a payload carries a random `rid` the
+   * server echoes back, so a reply meant for another request is never taken
+   * for this one's.
+   */
+  _request(socket, emitEvent, payload, resultEvents, ms = 5000) {
+    const events = [].concat(resultEvents);
+    const rid = payload ? this._toB64(crypto.getRandomValues(new Uint8Array(9))) : null;
+    return new Promise(resolve => {
+      const handlers = events.map(ev => [ev, (d) => {
+        if (rid && (!d || d.rid !== rid)) return;
+        done({ event: ev, data: d });
+      }]);
+      const done = (r) => { clearTimeout(t); handlers.forEach(([ev, h]) => socket.off(ev, h)); resolve(r); };
+      const t = setTimeout(() => done(null), ms);
+      handlers.forEach(([ev, h]) => socket.on(ev, h));
+      socket.emit(emitEvent, rid ? { ...payload, rid } : payload);
+    });
+  }
+  /**
+   * Load this account's signing key from its backup, or make one. Shared by
+   * every caller while it runs: two overlapping runs could each make a key,
+   * leaving the backup holding one while the server pinned the other.
+   */
+  initSigning(socket, { force = false } = {}) {
+    if (this._signingPair && !force) return Promise.resolve(true);
+    if (!this._signingInit) {
+      this._signingInit = this._initSigningOnce(socket, force).finally(() => { this._signingInit = null; });
+    }
+    return this._signingInit;
+  }
+  async _initSigningOnce(socket, force, retried = false) {
+    if (!this._ready || !this._keyPair || !socket || typeof HavenGroupCrypto === 'undefined') return false;
+    const reply = await this._request(socket, 'get-encrypted-key', undefined, 'encrypted-key-result');
+    const probe = reply && reply.data;
+    if (!probe) return false;
+    const wrapKey = await this._signingWrapKey();
+    const pinned = probe.signingKey || null;
+    let pair = null;
+    if (probe.signingBackup && !force) {
+      try {
+        const o = JSON.parse(probe.signingBackup);
+        const raw = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: this._fromB64(o.iv) }, wrapKey, this._fromB64(o.ct));
+        const jwk = JSON.parse(new TextDecoder().decode(raw));
+        const privateKey = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+        const publicKey = await crypto.subtle.importKey('jwk', { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y, ext: true }, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+        pair = { privateKey, publicKey };
+      } catch (err) {
+        // Sealed to an encryption key this account no longer has (a key reset).
+        console.warn('[E2E] Signing key backup could not be opened, making a new signing key:', err.message);
+        pair = null;
+      }
+    }
+    let publicJwk = pair ? await HavenGroupCrypto.exportPublicJwk(pair.publicKey) : null;
+    const matchesPin = !!(pinned && publicJwk && pinned.x === publicJwk.x && pinned.y === publicJwk.y);
+    let backup;
+    if (!pair || (pinned && !matchesPin)) {
+      const fresh = await HavenGroupCrypto.generateSigningKeyPair();
+      const privateJwk = await crypto.subtle.exportKey('jwk', fresh.privateKey);
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, wrapKey, new TextEncoder().encode(JSON.stringify(privateJwk)));
+      backup = JSON.stringify({ v: 1, iv: this._toB64(iv), ct: this._toB64(new Uint8Array(ct)) });
+      pair = fresh;
+      publicJwk = await HavenGroupCrypto.exportPublicJwk(fresh.publicKey);
+    }
+    if (!matchesPin) {
+      // The key and its backup are stored in one step, so the server can never
+      // pin one key while the backup holds another.
+      const res = await this._request(socket, 'publish-signing-key', { jwk: publicJwk, backup, force: !!pinned }, ['signing-key-published', 'signing-key-conflict']);
+      if (!res) return false;
+      if (res.event === 'signing-key-conflict') {
+        // Another tab or device got there first. Its key and backup are on the
+        // server now, so load those instead of fighting over it.
+        return retried ? false : this._initSigningOnce(socket, false, true);
+      }
+    }
+    this._signingPair = pair;
+    this._signingPublicJwk = publicJwk;
+    return true;
+  }
   requestPartnerKey(socket, userId) {
     return new Promise(resolve => {
       const t = setTimeout(() => resolve(null), 5000);
@@ -519,9 +616,9 @@ class HavenE2E {
 
   /**
    * Restore with status awareness. Returns { pair, status }:
-   *   status = 'present' — backup found (pair may still be null if unwrap failed)
-   *   status = 'none'    — server confirmed empty; caller may generate fresh keys
-   *   status = 'unknown' — network issue; caller MUST NOT overwrite server state
+   *   status = 'present': backup found (pair may still be null if unwrap failed)
+   *   status = 'none':    server confirmed empty; caller may generate fresh keys
+   *   status = 'unknown': network issue; caller MUST NOT overwrite server state
    */
   async _restoreFromServerWithState(socket, secret) {
     const probe = await this._fetchBackupWithState(socket);
@@ -534,7 +631,7 @@ class HavenE2E {
       console.log('[E2E] Restored from server backup');
       return { pair, status: 'present' };
     } catch {
-      console.warn('[E2E] Server backup unwrap failed — keys NOT auto-regenerated to protect other devices');
+      console.warn('[E2E] Server backup unwrap failed; keys NOT auto-regenerated to protect other devices');
       return { pair: null, status: 'present' };
     }
   }
@@ -586,11 +683,12 @@ class HavenE2E {
    * the returned object is truthy; callers that want richer feedback can read .ok.
    */
   async syncFromServer(socket, wrappingKey) {
+    this._signingPair = null;
     if (!wrappingKey) return { ok: false, reason: 'bad-password' };
     try {
       await this._openDB();
 
-      // Probe state FIRST before clearing local keys — if the server is
+      // Probe state FIRST before clearing local keys: if the server is
       // unreachable or returns 'unknown', we must NOT wipe a working local
       // keypair. Old behaviour cleared local first, then tried to fetch,
       // which left the user keyless on flaky networks.
@@ -606,15 +704,15 @@ class HavenE2E {
       try {
         jwk = await this._unwrap(wrappingKey, probe.data.encryptedKey, probe.data.salt);
       } catch (unwrapErr) {
-        // AES-GCM auth tag failure — wrapping key (password-derived) is wrong.
+        // AES-GCM auth tag failure: wrapping key (password-derived) is wrong.
         // Do NOT clear local keys: the user might still have a usable keypair
         // from a previous session. The original bug here treated this as
         // 'no backup' which prompted the user to Reset and lose all DMs.
-        console.warn('[E2E] Unwrap failed — password mismatch:', unwrapErr.message);
+        console.warn('[E2E] Unwrap failed (password mismatch):', unwrapErr.message);
         return { ok: false, reason: 'bad-password' };
       }
 
-      // Unwrap succeeded — NOW it's safe to swap the local keypair.
+      // Unwrap succeeded, so NOW it's safe to swap the local keypair.
       await this._clearLocal();
       this._sharedKeys = {};
       this._keyPair = await this._importPair(jwk);

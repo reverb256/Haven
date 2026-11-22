@@ -11,7 +11,7 @@
  *   node scripts/validate-locales.js public/locales/fr.json
  *
  * Exit code 0 = pass, 1 = fail. Warnings (extra keys, missing keys) do
- * NOT fail the run — only structural problems do, so partial translations
+ * NOT fail the run; only structural problems do, so partial translations
  * are still mergeable.
  *
  * Checks performed:
@@ -22,9 +22,9 @@
  *      (string vs object) as the corresponding key in en.json. (i.e.
  *      no accidentally turning a string into an object or vice versa,
  *      which would break the i18n lookup at runtime.)
- *   4. No keys reference paths that don't exist in en.json (warn — could
+ *   4. No keys reference paths that don't exist in en.json (warn: could
  *      indicate a typo or a stale string).
- *   5. Reports missing keys (warn — fine for in-progress translations).
+ *   5. Reports missing keys (warn: fine for in-progress translations).
  *
  * IMPORTANT FOR FUTURE AGENTS:
  *   If you add new translation keys to en.json, the other locale files
@@ -43,7 +43,7 @@ const MASTER_FILE = path.join(LOCALES_DIR, 'en.json');
 
 function loadJson(file) {
   const raw = fs.readFileSync(file, 'utf8');
-  return JSON.parse(raw); // throws on parse error — caught by caller
+  return JSON.parse(raw); // throws on parse error, caught by caller
 }
 
 // Walk an object and yield "dot.path" -> typeof value pairs.
@@ -103,12 +103,12 @@ function validateLocale(filePath, master) {
   for (const [k, t] of shape) {
     if (k.startsWith('_meta')) continue;
     if (!master.has(k)) {
-      result.warnings.push(`Unknown key "${k}" — not present in en.json (possible typo or stale)`);
+      result.warnings.push(`Unknown key "${k}": not present in en.json (possible typo or stale)`);
       continue;
     }
     const masterType = master.get(k);
     if (masterType !== t) {
-      result.errors.push(`Key "${k}" type mismatch — en.json has "${masterType}", this file has "${t}"`);
+      result.errors.push(`Key "${k}" type mismatch: en.json has "${masterType}", this file has "${t}"`);
     }
   }
   // Missing keys (warn only)
@@ -118,7 +118,7 @@ function validateLocale(filePath, master) {
     if (!shape.has(k)) missing++;
   }
   if (missing > 0) {
-    result.warnings.push(`${missing} keys missing from this locale (partial translation — OK, English will be used as fallback)`);
+    result.warnings.push(`${missing} keys missing from this locale (partial translation: OK, English will be used as fallback)`);
   }
   return result;
 }

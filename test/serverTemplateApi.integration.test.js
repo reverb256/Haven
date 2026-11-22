@@ -1,0 +1,105 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const net = require('node:net');
+const os = require('node:os');
+const path = require('node:path');
+const { spawn } = require('node:child_process');
+const { io } = require('socket.io-client');
+const DATA = fs.mkdtempSync(path.join(os.tmpdir(), 'haven-template-api-'));
+let server, base, sock;
+const freePort = () => new Promise((resolve, reject) => { const s = net.createServer(); s.once('error', reject); s.listen(0, '127.0.0.1', () => { const { port } = s.address(); s.close(() => resolve(port)); }); });
+const json = async (res) => ({ status: res.status, body: await res.json().catch(() => null) });
+const post = (p, token, body) => fetch(base + p, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) }, body: JSON.stringify(body) }).then(json);
+const upload = (token, obj) => { const fd = new FormData(); fd.append('template', new Blob([typeof obj === 'string' ? obj : JSON.stringify(obj)], { type: 'application/json' }), 'x.haven-template.json'); return fetch(`${base}/api/admin/template/upload`, { method: 'POST', headers: { Authorization: `Bearer ${token}` }, body: fd }).then(json); };
+const register = (username) => post('/api/auth/register', null, { username, password: 'templatetest123', eulaVersion: '2.0', ageVerified: true }).then((r) => r.body);
+const template = {
+  format: 'haven-server-template', version: 1, meta: { name: 'Book Club' },
+  server: { settings: { server_name: 'Book Club', channel_sort_mode: 'manual', welcome_message: 'Welcome {user}' }, defaultJoinChannels: ['lobby'] },
+  roles: [{ ref: 'host', name: 'Host', level: 40, color: '#aa3366', permissions: ['pin_message', 'set_channel_topic'] }],
+  channels: [
+    { ref: 'lobby', name: 'lobby', category: 'Club', topic: 'Say hi', welcome: true },
+    { ref: 'reading', name: 'reading-now', category: 'Club', forum: true, forumTags: [{ name: 'Fiction' }] },
+    { ref: 'hosts', name: 'hosts', category: 'Club', private: true, roleGate: { mode: 'any', roles: ['host'] } },
+  ],
+  posts: [{ channel: 'lobby', author: 'Club Bot', pinned: true, content: 'Read the pinned list.' }],
+};
+test.before(async () => {
+  const port = await freePort();
+  base = `http://127.0.0.1:${port}`;
+  server = spawn(process.execPath, ['server.js'], { cwd: path.join(__dirname, '..'), env: { ...process.env, PORT: String(port), HOST: '127.0.0.1', HAVEN_DATA_DIR: DATA, ADMIN_USERNAME: 'admin', FORCE_HTTP: 'true' }, stdio: 'ignore' });
+  for (let i = 0; i < 80; i++) { try { if ((await fetch(`${base}/api/health`)).ok) return; } catch { /* not listening yet, try again */ } await new Promise((r) => setTimeout(r, 250)); }
+  throw new Error('server did not start');
+});
+// Windows keeps the database locked until the server process has really
+// exited, so wait for it before removing the data folder.
+test.after(async () => {
+  // A failed assertion leaves the socket open, which would keep the run alive.
+  sock?.close();
+  if (server && server.exitCode === null) {
+    const exited = new Promise((r) => server.once('exit', r));
+    server.kill();
+    await Promise.race([exited, new Promise((r) => setTimeout(r, 5000))]);
+  }
+  fs.rmSync(DATA, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+});
+test('server templates over HTTP: admin only, preview, apply, live update', async () => {
+  const admin = await register('admin');
+  const member = await register('member');
+  assert.ok(admin.token && member.token);
+  assert.equal((await fetch(`${base}/api/admin/template/export`)).status, 403);
+  assert.equal((await fetch(`${base}/api/admin/template/export`, { headers: { Authorization: `Bearer ${member.token}` } })).status, 403);
+  assert.equal((await upload(member.token, template)).status, 403);
+  assert.equal((await post('/api/admin/template/apply', member.token, { id: 'x' })).status, 403);
+  const exp = await fetch(`${base}/api/admin/template/export`, { headers: { Authorization: `Bearer ${admin.token}` } });
+  assert.equal(exp.status, 200);
+  assert.match(exp.headers.get('content-disposition'), /\.haven-template\.json/);
+  const exported = await exp.json();
+  assert.equal(exported.format, 'haven-server-template');
+  assert.ok(!JSON.stringify(exported).includes(admin.token));
+  const badJson = await upload(admin.token, '{nope');
+  assert.equal(badJson.status, 400);
+  const invalid = await upload(admin.token, { ...template, channels: [{ ref: 'x', name: '<b>' }] });
+  assert.equal(invalid.status, 400);
+  assert.ok(invalid.body.details.some((d) => /channels\[0\]\.name/.test(d)));
+  const up = await upload(admin.token, template);
+  assert.equal(up.status, 200, JSON.stringify(up.body));
+  assert.equal(up.body.summary.channels, 3);
+  assert.equal((await post('/api/admin/template/plan', member.token, { id: up.body.id })).status, 403);
+  const plan = await post('/api/admin/template/plan', admin.token, { id: up.body.id, mode: 'replace' });
+  assert.equal(plan.status, 200);
+  assert.deepEqual(plan.body.created.channels, ['lobby', 'reading-now', 'hosts']);
+  assert.equal(plan.body.dryRun, true);
+  sock = io(base, { auth: { token: member.token }, transports: ['websocket'], forceNew: true });
+  await new Promise((r, j) => { sock.on('connect', r); sock.on('connect_error', j); });
+  const listed = new Promise((r) => sock.on('channels-list', (list) => { if (list.some((c) => c.name === 'lobby')) r(list); }));
+  const renamed = new Promise((r) => sock.on('server-setting-changed', (s) => { if (s.key === 'server_name_effective' && s.value === 'Book Club') r(true); }));
+  const applied = await post('/api/admin/template/apply', admin.token, { id: up.body.id, mode: 'replace' });
+  assert.equal(applied.status, 200, JSON.stringify(applied.body));
+  assert.equal(applied.body.dryRun, false);
+  assert.equal(applied.body.counts.posts, 1);
+  const list = await Promise.race([listed, new Promise((r) => setTimeout(() => r(null), 5000))]);
+  assert.ok(list, 'members get the new channel list without reloading');
+  assert.ok(!list.some((c) => c.name === 'hosts'), 'the role-gated channel stays hidden from a member without the role');
+  assert.ok(await Promise.race([renamed, new Promise((r) => setTimeout(() => r(false), 5000))]), 'members see the new server name without reloading');
+  const Database = require('better-sqlite3');
+  const db = new Database(path.join(DATA, 'haven.db'), { readonly: true });
+  const audit = db.prepare("SELECT action, target_name, details FROM audit_log WHERE action IN ('server_template_apply', 'server_setting_update', 'role_create') ORDER BY id").all();
+  db.close();
+  const summary = audit.find((a) => a.action === 'server_template_apply');
+  assert.ok(summary && JSON.parse(summary.details).created.channels.includes('lobby'), 'the audit entry says what was created');
+  assert.ok(audit.some((a) => a.action === 'server_setting_update' && a.target_name === 'server_name'), 'each changed setting is logged');
+  const host = audit.find((a) => a.action === 'role_create' && a.target_name === 'Host');
+  assert.deepEqual(JSON.parse(host.details).permissions, ['pin_message', 'set_channel_topic'], 'the new role is logged with its permissions');
+  // Replacing a role a member holds pushes them their new permissions at once.
+  const trimmed = new Promise((r) => sock.on('roles-updated', (d) => { if (d && Array.isArray(d.permissions) && !d.permissions.includes('upload_files')) r(d.permissions); }));
+  const up2 = await upload(admin.token, { format: 'haven-server-template', version: 1, meta: { name: 'Quiet' }, roles: [{ ref: 'member', name: 'Member', level: 1, permissions: ['use_voice', 'view_history'] }] });
+  assert.equal(up2.status, 200, JSON.stringify(up2.body));
+  const applied2 = await post('/api/admin/template/apply', admin.token, { id: up2.body.id, mode: 'replace' });
+  assert.deepEqual(applied2.body.updated.roles, ['Member'], JSON.stringify(applied2.body));
+  const pushed = await Promise.race([trimmed, new Promise((r) => setTimeout(() => r(null), 5000))]);
+  assert.ok(pushed && pushed.includes('use_voice'), 'the member gets their new permissions without reconnecting');
+  sock.close();
+  assert.equal((await post('/api/admin/template/apply', admin.token, { id: up.body.id })).status, 404, 'an upload is used once');
+});

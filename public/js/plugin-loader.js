@@ -20,7 +20,7 @@ window.HavenPluginLoader = (function () {
   'use strict';
 
   // ═══════════════════════════════════════════════════════
-  //  HavenApi — exposed to plugins as window.HavenApi
+  //  HavenApi: exposed to plugins as window.HavenApi
   // ═══════════════════════════════════════════════════════
 
   const HavenApi = {
@@ -41,6 +41,41 @@ window.HavenPluginLoader = (function () {
       /** Query inside the app */
       query(sel) { return document.querySelector(sel); },
       queryAll(sel) { return [...document.querySelectorAll(sel)]; },
+    },
+
+    // Structural layout plugins are mutually exclusive. Acquiring the shared
+    // owner before moving regions prevents two reversible plugins from saving
+    // each other's temporary DOM as their native restore point.
+    Layout: {
+      _owner: null,
+      _reservedOwner: null,
+      acquire(owner) {
+        const id = String(owner || '').trim();
+        if (!id || (this._reservedOwner && this._reservedOwner !== id)
+            || (this._owner && this._owner !== id)) return false;
+        if (this._owner === id) return true;
+        this._owner = id;
+        document.documentElement.setAttribute('data-haven-layout-owner', id);
+        document.dispatchEvent(new CustomEvent('haven:layout-owner-change', { detail: { owner: id } }));
+        return true;
+      },
+      release(owner) {
+        if (this._owner !== String(owner || '').trim()) return false;
+        this._owner = null;
+        document.documentElement.removeAttribute('data-haven-layout-owner');
+        document.dispatchEvent(new CustomEvent('haven:layout-owner-change', { detail: { owner: null } }));
+        return true;
+      },
+      _reserve(owner) {
+        this._reservedOwner = String(owner || '').trim() || null;
+      },
+      _clearReservation(owner) {
+        const id = String(owner || '').trim() || null;
+        if (this._reservedOwner !== id) return false;
+        this._reservedOwner = null;
+        return true;
+      },
+      get owner() { return this._owner; },
     },
 
     // ── Data (localStorage wrapper) ──
@@ -69,16 +104,14 @@ window.HavenPluginLoader = (function () {
           window.app._showToast(message, type);
         }
       },
-      /** Show a simple confirm dialog — returns a Promise<boolean> */
+      /** Show a simple confirm dialog; returns a Promise<boolean> */
       confirm(title, message) {
-        return new Promise(resolve => {
-          const result = window.confirm(`${title}\n\n${message}`);
-          resolve(result);
-        });
+        if (window.app && window.app._showConfirmModal) return window.app._showConfirmModal(title, message);
+        return Promise.resolve(window.confirm(`${title}\n\n${message}`));
       },
     },
 
-    // ── Patcher — monkey-patch methods reversibly ──
+    // ── Patcher: monkey-patch methods reversibly ──
     Patcher: {
       _patches: new Map(),
 
@@ -162,23 +195,147 @@ window.HavenPluginLoader = (function () {
 
   const loadedPlugins = new Map();  // name → { instance, meta, enabled }
   const loadedThemes  = new Map();  // name → { meta, enabled, linkEl }
+  const ThemeCompat = window.HavenThemeCompat;
+
+  function detectSafeMode() {
+    if (ThemeCompat?.isSafeMode?.(window.location) === true) return true;
+    let requested = null;
+    try { requested = new URLSearchParams(window.location.search).get('haven-safe-mode'); } catch { /* unreadable address: not in safe mode through the URL */ }
+    try {
+      if (requested === '1') sessionStorage.setItem('haven_safe_mode', '1');
+      if (requested === '0') sessionStorage.removeItem('haven_safe_mode');
+      if (requested === '0') return false;
+      return requested === '1'
+        || document.documentElement.hasAttribute('data-haven-safe-mode')
+        || sessionStorage.getItem('haven_safe_mode') === '1';
+    } catch {
+      return requested === '1' || document.documentElement.hasAttribute('data-haven-safe-mode');
+    }
+  }
+
+  const safeMode = detectSafeMode();
+  function detectRecoveryPending() {
+    if (ThemeCompat?.isResetPending?.() === true) return true;
+    try { return sessionStorage.getItem('haven_customizations_reset_pending') === '1'; } catch { return false; }
+  }
+
+  function clearSafeMode() {
+    ThemeCompat?.clearSafeMode?.();
+    try { sessionStorage.removeItem('haven_safe_mode'); } catch { /* storage blocked: nothing to clear */ }
+  }
+
+  function clearResetPending() {
+    ThemeCompat?.clearResetPending?.();
+    try { sessionStorage.removeItem('haven_customizations_reset_pending'); } catch { /* storage blocked: nothing to clear */ }
+  }
+
+  function resetLocalCustomizations() {
+    try {
+      localStorage.setItem('haven_theme', 'haven');
+      localStorage.setItem('haven_enabled_themes', '[]');
+      localStorage.setItem('haven_enabled_plugins', '[]');
+      sessionStorage.setItem('haven_customizations_reset_pending', '1');
+    } catch (err) { console.warn('[Safe mode] could not reset local customizations', err); }
+  }
+
+  function urlWithoutSafeMode() {
+    const fromHelper = ThemeCompat?.urlWithoutSafeMode?.(window.location);
+    if (fromHelper) return fromHelper;
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('haven-safe-mode');
+      return `${url.pathname}${url.search}${url.hash}`;
+    } catch {
+      return '/app.html';
+    }
+  }
+
+  let recoveryPending = detectRecoveryPending();
+  const suppressExtensions = safeMode || recoveryPending;
+  let themeMetadataReady = false;
+  let pendingFileTheme = null;
+
+  function storedList(key) {
+    try {
+      const value = JSON.parse(localStorage.getItem(key) || '[]');
+      return Array.isArray(value) ? value.filter(item => typeof item === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
 
   function getEnabledPlugins() {
-    return JSON.parse(localStorage.getItem('haven_enabled_plugins') || '[]');
+    return storedList('haven_enabled_plugins');
   }
   function setEnabledPlugins(list) {
     localStorage.setItem('haven_enabled_plugins', JSON.stringify(list));
   }
   function getEnabledThemes() {
-    return JSON.parse(localStorage.getItem('haven_enabled_themes') || '[]');
+    return storedList('haven_enabled_themes');
   }
   function setEnabledThemes(list) {
     localStorage.setItem('haven_enabled_themes', JSON.stringify(list));
+  }
+  // Published themes are what the theme picker offers, so only one can be
+  // active at a time. Palettes (Braid, Compact, anything that sets
+  // --bg-primary) are the same even when an admin has not published them:
+  // they replace the built-in tokens, they do not stack on Matrix.
+  // Unpublished files without a palette stay additive CSS tweaks.
+  function isExclusiveMeta(meta) {
+    if (!meta) return false;
+    if (meta.published || meta.palette) return true;
+    if (meta.layout) return true;
+    return /^(braid|braid-light|compact)\.theme\.css$/i.test(meta.file || '');
+  }
+  function isExclusiveTheme(file) {
+    const t = loadedThemes.get(file);
+    return isExclusiveMeta(t ? { ...t.meta, file } : { file });
+  }
+  function getActiveFileTheme() {
+    const saved = localStorage.getItem('haven_theme') || '';
+    return saved.startsWith('file:') ? saved.slice(5) : null;
+  }
+
+  function isThemeCompatible(meta) {
+    return !!meta && meta.compatible !== false
+      && meta.compatibility !== 'invalid'
+      && meta.compatibility !== 'unsupported';
+  }
+
+  // Members use Haven's own themes and the theme files an admin published.
+  // People who manage the server also get the rest, to try them and publish
+  // them. Until the app knows who is signed in, nobody does. The server makes
+  // the same check before it saves a theme file to an account.
+  function canUseUnpublished() {
+    return window.app?._canPublishThemes?.() === true;
+  }
+  function isOffered(file) {
+    const t = loadedThemes.get(file);
+    return !!t && (t.meta?.published === true || canUseUnpublished());
+  }
+  // Settings lists what the viewer may use, plus an unpublished file they
+  // already have on, so they keep it and can still turn it off.
+  function isListed(file, record) {
+    return isOffered(file) || record.enabled || getActiveFileTheme() === file;
+  }
+
+  function registerSuppressedPlugin(meta) {
+    if (loadedPlugins.has(meta.file)) return;
+    loadedPlugins.set(meta.file, {
+      instance: null,
+      meta,
+      enabled: getEnabledPlugins().includes(meta.file),
+      suppressed: true,
+    });
   }
 
   // ── Load a single plugin ──
   async function loadPlugin(meta) {
     if (loadedPlugins.has(meta.file)) return;
+    if (suppressExtensions) {
+      registerSuppressedPlugin(meta);
+      return;
+    }
     try {
       const resp = await fetch(`/plugins/${meta.file}?_=${Date.now()}`);
       const code = await resp.text();
@@ -201,7 +358,7 @@ window.HavenPluginLoader = (function () {
         if (window[baseName] && typeof window[baseName] === 'function') {
           PluginClass = window[baseName];
         } else {
-          // Fallback: look for any class defined via the code — we wrap it
+          // Fallback: look for any class defined via the code (we wrap it)
           // The code itself may call _win.XYZ = class { ... }
           // Just re-execute looking for the return value
           const fn2 = new Function('HavenApi', '_win', code + '\n;return typeof start === "function" ? { start, stop: typeof stop === "function" ? stop : () => {} } : null;');
@@ -230,7 +387,7 @@ window.HavenPluginLoader = (function () {
   // ── Enable / disable a plugin ──
   function enablePlugin(file) {
     const p = loadedPlugins.get(file);
-    if (!p || p.enabled) return;
+    if (!p || p.enabled || suppressExtensions || !p.instance) return;
     p.enabled = true;
     try { p.instance.start(); } catch (err) { console.error(`[Plugin ${p.meta.name}] start() error:`, err); }
     const list = getEnabledPlugins();
@@ -242,11 +399,13 @@ window.HavenPluginLoader = (function () {
     const p = loadedPlugins.get(file);
     if (!p || !p.enabled) return;
     p.enabled = false;
-    try {
-      p.instance.stop();
-      HavenApi.Patcher.unpatchAll(p.meta.name || file);
-      HavenApi.DOM.removeStyle(p.meta.name || file);
-    } catch (err) { console.error(`[Plugin ${p.meta.name}] stop() error:`, err); }
+    if (p.instance) {
+      try {
+        p.instance.stop();
+        HavenApi.Patcher.unpatchAll(p.meta.name || file);
+        HavenApi.DOM.removeStyle(p.meta.name || file);
+      } catch (err) { console.error(`[Plugin ${p.meta.name}] stop() error:`, err); }
+    }
     const list = getEnabledPlugins().filter(f => f !== file);
     setEnabledPlugins(list);
     renderPluginUI();
@@ -254,22 +413,63 @@ window.HavenPluginLoader = (function () {
 
   // ── Load a theme ──
   function loadTheme(meta) {
-    if (loadedThemes.has(meta.file)) return;
-    const enabled = getEnabledThemes().includes(meta.file);
+    const compatible = isThemeCompatible(meta);
+    const existing = loadedThemes.get(meta.file);
+    if (existing) {
+      existing.meta = meta;
+      existing.compatible = compatible;
+      existing.suppressed = existing.enabled && (!compatible || suppressExtensions);
+      const shouldInject = existing.enabled && compatible && !suppressExtensions
+        && (!isExclusiveMeta({ ...meta, file: meta.file }) || getActiveFileTheme() === meta.file);
+      if (!shouldInject && existing.linkEl) {
+        existing.linkEl.remove();
+        existing.linkEl = null;
+      }
+      if (shouldInject && !existing.linkEl) {
+        const linkEl = document.createElement('link');
+        linkEl.rel = 'stylesheet';
+        linkEl.href = `/themes/${encodeURIComponent(meta.file)}?_=${Date.now()}`;
+        linkEl.id = `haven-theme-${meta.file}`;
+        document.head.appendChild(linkEl);
+        existing.linkEl = linkEl;
+      }
+      return;
+    }
+    // A published or palette theme is only on when it is the selected one;
+    // leaving a previously-selected one in the enabled list must not stack it
+    // on top of whatever theme is active now, or tick its Settings toggle.
+    const configured = getEnabledThemes().includes(meta.file)
+      && (!isExclusiveMeta({ ...meta, file: meta.file }) || getActiveFileTheme() === meta.file);
+    const shouldInject = configured && compatible && !suppressExtensions;
     let linkEl = null;
-    if (enabled) {
+    if (shouldInject) {
       linkEl = document.createElement('link');
       linkEl.rel = 'stylesheet';
-      linkEl.href = `/themes/${meta.file}?_=${Date.now()}`;
+      linkEl.href = `/themes/${encodeURIComponent(meta.file)}?_=${Date.now()}`;
       linkEl.id = `haven-theme-${meta.file}`;
       document.head.appendChild(linkEl);
     }
-    loadedThemes.set(meta.file, { meta, enabled, linkEl });
+    loadedThemes.set(meta.file, {
+      meta,
+      enabled: configured,
+      compatible,
+      suppressed: configured && (!compatible || suppressExtensions),
+      linkEl,
+    });
   }
 
   function enableTheme(file) {
     const t = loadedThemes.get(file);
-    if (!t || t.enabled) return;
+    if (!t || t.enabled || suppressExtensions || !t.compatible) return;
+    if (!isOffered(file)) return;
+    // A published theme is one of the picker's choices, not a stackable tweak:
+    // turning it on means selecting it, so the two surfaces stay in agreement.
+    // The account's saved theme has to follow, the same as a picker click,
+    // or the server's older choice replaces this one on the next load.
+    if (isExclusiveMeta({ ...t.meta, file })) {
+      if (applyFileTheme(file)) void persistThemePreference(`file:${file}`);
+      return;
+    }
     t.enabled = true;
     const linkEl = document.createElement('link');
     linkEl.rel = 'stylesheet';
@@ -287,10 +487,160 @@ window.HavenPluginLoader = (function () {
     if (!t || !t.enabled) return;
     t.enabled = false;
     if (t.linkEl) { t.linkEl.remove(); t.linkEl = null; }
+    t.suppressed = false;
     document.getElementById(`haven-theme-${file}`)?.remove();
     const list = getEnabledThemes().filter(f => f !== file);
     setEnabledThemes(list);
+    // Turning off the selected published theme deselects it, which means falling
+    // back to the built-in default rather than leaving the picker pointing at a
+    // stylesheet that is no longer loaded.
+    if (isExclusiveMeta({ ...t.meta, file }) && getActiveFileTheme() === file) {
+      selectBuiltinTheme('haven');
+    }
     renderPluginUI();
+  }
+
+  // Switch back to a built-in data-theme, mirroring what a theme-picker button
+  // does in theme.js (which isn't reachable from here as a function).
+  function selectBuiltinTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    document.documentElement.removeAttribute('data-haven-theme-pending');
+    localStorage.setItem('haven_theme', theme);
+    document.querySelectorAll('.theme-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.theme === theme);
+    });
+    if (window.havenSocket && window.havenSocket.connected) {
+      window.havenSocket.emit('set-preference', { key: 'theme', value: theme });
+    }
+    if (!suppressExtensions && typeof applyEffects === 'function') {
+      applyEffects(typeof _getStoredEffectMode === 'function' ? _getStoredEffectMode() : 'auto');
+    }
+    if (!suppressExtensions && typeof showEffectEditorIfDynamic === 'function') showEffectEditorIfDynamic(theme);
+  }
+
+  function persistThemePreference(theme) {
+    return new Promise(resolve => {
+      const socket = window.havenSocket;
+      if (!socket) return resolve(false);
+
+      let settled = false;
+      let send;
+      let connectionTimer = null;
+      let saveTimer = null;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        if (connectionTimer) clearTimeout(connectionTimer);
+        if (saveTimer) clearTimeout(saveTimer);
+        socket.off?.('preference-saved', onSaved);
+        socket.off?.('preference-refused', onRefused);
+        if (send) socket.off?.('connect', send);
+        resolve(value);
+      };
+      const onSaved = data => {
+        if (data?.key === 'theme' && data.value === theme) finish(true);
+      };
+      const onRefused = data => {
+        if (data?.key === 'theme' && data.value === theme) finish(false);
+      };
+      send = () => {
+        if (connectionTimer) clearTimeout(connectionTimer);
+        socket.on?.('preference-saved', onSaved);
+        socket.on?.('preference-refused', onRefused);
+        socket.emit('set-preference', { key: 'theme', value: theme });
+        saveTimer = setTimeout(() => finish(false), 1200);
+      };
+
+      if (socket.connected) send();
+      else {
+        socket.once?.('connect', send);
+        connectionTimer = setTimeout(() => finish(false), 1500);
+      }
+    });
+  }
+
+  function fallbackToHaven(file, notify = true, syncPreference = false) {
+    document.querySelectorAll('link[id^="haven-theme-"]').forEach(link => link.remove());
+    document.documentElement.setAttribute('data-theme', 'haven');
+    document.documentElement.removeAttribute('data-haven-theme-pending');
+    localStorage.setItem('haven_theme', 'haven');
+    setEnabledThemes(getEnabledThemes().filter(name => name !== file));
+    const record = loadedThemes.get(file);
+    if (record) {
+      record.enabled = false;
+      record.suppressed = false;
+      record.linkEl = null;
+    }
+    document.querySelectorAll('.theme-btn').forEach(button => {
+      button.classList.toggle('active', button.dataset.theme === 'haven');
+    });
+    if (!suppressExtensions && typeof applyEffects === 'function') {
+      const fxMode = typeof _getStoredEffectMode === 'function' ? _getStoredEffectMode() : 'auto';
+      applyEffects(fxMode, 'haven');
+    }
+    if (!suppressExtensions && typeof showEffectEditorIfDynamic === 'function') {
+      showEffectEditorIfDynamic('haven');
+    }
+    if (syncPreference) void persistThemePreference('haven');
+    if (notify) HavenApi.UI.showToast(t('settings.plugins_section.theme_fallback'), 'warning');
+    renderPluginUI();
+  }
+
+  // The server would not save a theme file as this account's theme: it is
+  // not published (see set-preference). Put Haven back rather than show a
+  // theme the account cannot keep.
+  function onThemeRefused(value) {
+    if (typeof value !== 'string' || !value.startsWith('file:')) return;
+    const file = value.slice(5);
+    if (getActiveFileTheme() !== file) return;
+    fallbackToHaven(file, false, true);
+    HavenApi.UI.showToast(t('settings.plugins_section.theme_not_published'), 'warning');
+  }
+
+  async function resetCustomizations() {
+    resetLocalCustomizations();
+    recoveryPending = true;
+    document.querySelectorAll('link[id^="haven-theme-"]').forEach(link => link.remove());
+    document.documentElement.setAttribute('data-theme', 'haven');
+    loadedPlugins.forEach(plugin => { plugin.enabled = false; });
+    loadedThemes.forEach(theme => {
+      theme.enabled = false;
+      theme.suppressed = false;
+      theme.linkEl = null;
+    });
+    renderPluginUI();
+
+    const saved = await persistThemePreference('haven');
+    if (saved) {
+      recoveryPending = false;
+      clearResetPending();
+      clearSafeMode();
+      window.location.assign(urlWithoutSafeMode());
+      return;
+    }
+    setupSafeModeUI();
+    HavenApi.UI.showToast(t('settings.plugins_section.reset_sync_pending'), 'warning');
+  }
+
+  function setupSafeModeUI() {
+    const notice = document.getElementById('extension-safe-mode-notice');
+    if (!notice) return;
+    notice.style.display = suppressExtensions ? '' : 'none';
+    const exitButton = document.getElementById('extension-safe-mode-exit-btn');
+    if (exitButton) exitButton.style.display = safeMode && !recoveryPending ? '' : 'none';
+    if (recoveryPending) {
+      const title = document.getElementById('extension-safe-mode-title');
+      const description = document.getElementById('extension-safe-mode-desc');
+      if (title) title.textContent = t('settings.plugins_section.recovery_pending_title');
+      if (description) description.textContent = t('settings.plugins_section.recovery_pending_desc');
+    }
+    if (!suppressExtensions || notice.dataset.bound === '1') return;
+    notice.dataset.bound = '1';
+    document.getElementById('extension-reset-btn')?.addEventListener('click', resetCustomizations);
+    document.getElementById('extension-safe-mode-exit-btn')?.addEventListener('click', () => {
+      clearSafeMode();
+      window.location.assign(urlWithoutSafeMode());
+    });
   }
 
 
@@ -298,7 +648,17 @@ window.HavenPluginLoader = (function () {
   //  Settings UI Rendering
   // ═══════════════════════════════════════════════════════
 
+  function themeCompatibilityLabel(meta) {
+    if (meta.compatibility === 'compatible') return `Theme API ${meta.themeApi}`;
+    if (!meta.compatibility || meta.compatibility === 'legacy') return t('settings.plugins_section.legacy_theme');
+    if (meta.compatibility === 'invalid') return t('settings.plugins_section.invalid_theme_api');
+    return t('settings.plugins_section.unsupported_theme_api');
+  }
+
   function renderPluginUI() {
+    // The theme picker redraws from the same records, so a theme switched on
+    // or off in Settings shows the same way in the picker.
+    document.dispatchEvent(new CustomEvent('haven:themes-changed'));
     const container = document.getElementById('plugin-list');
     const themeContainer = document.getElementById('theme-list');
     if (!container || !themeContainer) return;
@@ -311,14 +671,18 @@ window.HavenPluginLoader = (function () {
       for (const [file, p] of loadedPlugins) {
         const card = document.createElement('div');
         card.className = 'plugin-card';
+        const suppressedLabel = suppressExtensions && p.enabled
+          ? ` • ${escHtml(t('settings.plugins_section.suppressed_safe_mode'))}`
+          : '';
+        const toggleDisabled = suppressExtensions && !p.enabled;
         card.innerHTML = `
           <div class="plugin-card-info">
             <div class="plugin-card-name">${escHtml(p.meta.name || file)}</div>
             <div class="plugin-card-desc">${escHtml(p.meta.description || '')}</div>
-            <div class="plugin-card-meta">${escHtml(p.meta.author || '')}${p.meta.version ? ' • v' + escHtml(p.meta.version) : ''}</div>
+            <div class="plugin-card-meta">${escHtml(p.meta.author || '')}${p.meta.version ? ' • v' + escHtml(p.meta.version) : ''}${suppressedLabel}</div>
           </div>
           <label class="plugin-toggle">
-            <input type="checkbox" ${p.enabled ? 'checked' : ''}>
+            <input type="checkbox" ${p.enabled ? 'checked' : ''} ${toggleDisabled ? 'disabled' : ''}>
             <span class="plugin-toggle-slider"></span>
           </label>
         `;
@@ -330,22 +694,37 @@ window.HavenPluginLoader = (function () {
       }
     }
 
-    // Themes
+    // Themes. Members only see published files, plus one they already have on.
+    const listedThemes = [...loadedThemes].filter(([file, record]) => isListed(file, record));
     if (loadedThemes.size === 0) {
       themeContainer.innerHTML = '<p class="plugin-empty">No themes found. Drop <code>.theme.css</code> files into the <code>themes/</code> folder.</p>';
+    } else if (listedThemes.length === 0) {
+      themeContainer.innerHTML = `<p class="plugin-empty">${escHtml(t('settings.plugins_section.no_published_themes'))}</p>`;
     } else {
       themeContainer.innerHTML = '';
-      for (const [file, t] of loadedThemes) {
+      for (const [file, themeRecord] of listedThemes) {
         const card = document.createElement('div');
         card.className = 'plugin-card';
+        const compatibilityLabel = themeCompatibilityLabel(themeRecord.meta);
+        const suppressedLabel = themeRecord.suppressed
+          ? ` • ${escHtml(suppressExtensions
+            ? t('settings.plugins_section.suppressed_safe_mode')
+            : t('settings.plugins_section.incompatible_theme'))}`
+          : '';
+        // Admins see which files only they can use; a member sees it on the
+        // one they kept, which they can turn off but not back on.
+        const publishLabel = themeRecord.meta.published
+          ? ''
+          : ` • ${escHtml(t('settings.plugins_section.not_published'))}`;
+        const toggleDisabled = (!themeRecord.compatible || suppressExtensions || !isOffered(file)) && !themeRecord.enabled;
         card.innerHTML = `
           <div class="plugin-card-info">
-            <div class="plugin-card-name">${escHtml(t.meta.name || file)}</div>
-            <div class="plugin-card-desc">${escHtml(t.meta.description || '')}</div>
-            <div class="plugin-card-meta">${escHtml(t.meta.author || '')}${t.meta.version ? ' • v' + escHtml(t.meta.version) : ''}</div>
+            <div class="plugin-card-name">${escHtml(themeRecord.meta.name || file)}</div>
+            <div class="plugin-card-desc">${escHtml(themeRecord.meta.description || '')}</div>
+            <div class="plugin-card-meta">${escHtml(themeRecord.meta.author || '')}${themeRecord.meta.version ? ' • v' + escHtml(themeRecord.meta.version) : ''} • ${escHtml(compatibilityLabel)}${publishLabel}${suppressedLabel}</div>
           </div>
           <label class="plugin-toggle">
-            <input type="checkbox" ${t.enabled ? 'checked' : ''}>
+            <input type="checkbox" ${themeRecord.enabled ? 'checked' : ''} ${toggleDisabled ? 'disabled' : ''}>
             <span class="plugin-toggle-slider"></span>
           </label>
         `;
@@ -366,74 +745,100 @@ window.HavenPluginLoader = (function () {
 
 
   // ═══════════════════════════════════════════════════════
-  //  Init — fetch & load all plugins and themes
+  //  Init: fetch & load all plugins and themes
   // ═══════════════════════════════════════════════════════
 
-  async function init() {
+  async function fetchList(url) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return null;
+      const value = await response.json();
+      return Array.isArray(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async function init(forceThemeRefresh = false) {
     try {
       const [pluginRes, themeRes] = await Promise.all([
-        fetch('/api/plugins').then(r => r.json()).catch(() => []),
-        fetch('/api/themes').then(r => r.json()).catch(() => []),
+        fetchList('/api/plugins'),
+        ThemeCompat?.fetchThemes?.(fetch, forceThemeRefresh) || fetchList('/api/themes'),
       ]);
 
-      // Load themes first (instant CSS injection)
-      for (const t of themeRes) loadTheme(t);
+      const authoritativeThemes = Array.isArray(themeRes);
+      if (authoritativeThemes) {
+        const availableFiles = new Set(themeRes.map(theme => theme.file));
+        for (const [file, record] of loadedThemes) {
+          if (availableFiles.has(file)) continue;
+          record.linkEl?.remove();
+          loadedThemes.delete(file);
+        }
+        ThemeCompat?.cacheThemes?.(themeRes);
+        themeMetadataReady = true;
+      } else {
+        // A network or response error is not proof that a saved theme vanished.
+        // Keep the preference and show the Haven base until metadata can be retried.
+        document.documentElement.removeAttribute('data-haven-theme-pending');
+      }
 
-      // Load plugins (may need network fetch + eval)
-      for (const p of pluginRes) await loadPlugin(p);
+      // Load themes first. Safe mode records them without injecting CSS.
+      for (const t of themeRes || []) loadTheme(t);
 
+      // loadPlugin() only records metadata while extensions are suppressed, so
+      // no plugin file is fetched or evaluated in safe/recovery mode.
+      for (const p of pluginRes || []) await loadPlugin(p);
+
+      if (!suppressExtensions && authoritativeThemes) {
+        const requested = pendingFileTheme || (getActiveFileTheme()
+          ? { file: getActiveFileTheme(), persist: false, syncFallback: false }
+          : null);
+        pendingFileTheme = null;
+        if (requested) {
+          const record = loadedThemes.get(requested.file);
+          if (record?.compatible) {
+            applyFileTheme(requested.file, requested.persist, requested.syncFallback);
+          }
+          else fallbackToHaven(requested.file, true, requested.syncFallback);
+        }
+      }
+
+      setupSafeModeUI();
       renderPluginUI();
-      injectPublishedThemeButtons(themeRes);
-      console.log(`[Haven] Loaded ${loadedPlugins.size} plugin(s), ${loadedThemes.size} theme(s)`);
+      if (recoveryPending) {
+        const saved = await persistThemePreference('haven');
+        if (saved) {
+          recoveryPending = false;
+          clearResetPending();
+          clearSafeMode();
+          window.location.assign(urlWithoutSafeMode());
+          return;
+        }
+        HavenApi.UI.showToast(t('settings.plugins_section.reset_sync_pending'), 'warning');
+      }
+      console.log(`[Haven] Loaded ${loadedPlugins.size} plugin(s), ${loadedThemes.size} theme(s)${suppressExtensions ? ' (suppressed)' : ''}`);
+      // The Sidebar Layout picker in Settings lists layout plugins once they are in.
+      document.dispatchEvent(new CustomEvent('haven:plugins-loaded'));
     } catch (err) {
       console.warn('[Haven] Plugin/theme init error:', err);
     }
   }
 
-  /**
-   * Inject published .theme.css files as selectable buttons into #theme-selector.
-   * These behave just like built-in themes but apply an external CSS file.
-   */
-  function injectPublishedThemeButtons(themeRes) {
-    const selector = document.getElementById('theme-selector');
-    if (!selector) return;
-    const published = themeRes.filter(t => t.published);
-    if (published.length === 0) return;
-
-    // Remove any previously injected custom-theme buttons (in case of re-init)
-    selector.querySelectorAll('.theme-btn[data-custom-theme]').forEach(b => b.remove());
-
-    for (const theme of published) {
-      const btn = document.createElement('button');
-      btn.className = 'theme-btn';
-      btn.dataset.theme = `file:${theme.file}`;
-      btn.dataset.customTheme = '1';
-      btn.title = theme.name || theme.file;
-      const icon = document.createElement('span');
-      icon.className = 'theme-icon';
-      icon.textContent = theme.icon || '🎨';
-      btn.appendChild(icon);
-
-      btn.addEventListener('click', () => {
-        // Apply the file theme exclusively
-        applyFileTheme(theme.file);
-        // Notify the socket if available
-        if (window.havenSocket && window.havenSocket.connected) {
-          window.havenSocket.emit('set-preference', { key: 'theme', value: `file:${theme.file}` });
-        }
-      });
-
-      selector.appendChild(btn);
+  // A theme picked in the theme picker. A full theme (published, or one
+  // that sets the palette) becomes the selected theme and is saved to the
+  // account, as a Settings toggle does. A theme that only adds CSS on top of
+  // the selected one is switched on or off instead.
+  function selectFileTheme(file) {
+    const t = loadedThemes.get(file);
+    if (!t || suppressExtensions || !t.compatible) return false;
+    if (!isOffered(file) && !t.enabled) return false;
+    if (!isExclusiveMeta({ ...t.meta, file })) {
+      if (t.enabled) disableTheme(file); else enableTheme(file);
+      return true;
     }
-
-    // Restore active state if a file theme is saved
-    const saved = localStorage.getItem('haven_theme') || '';
-    if (saved.startsWith('file:')) {
-      selector.querySelectorAll('.theme-btn').forEach(b => {
-        b.classList.toggle('active', b.dataset.theme === saved);
-      });
-      applyFileTheme(saved.slice(5), false);
-    }
+    if (t.enabled && getActiveFileTheme() === file) return true;
+    if (applyFileTheme(file)) void persistThemePreference(`file:${file}`);
+    return true;
   }
 
   /**
@@ -443,7 +848,18 @@ window.HavenPluginLoader = (function () {
    * @param {string} file  - e.g. "mytheme.theme.css"
    * @param {boolean} [persist=true] - whether to save to localStorage
    */
-  function applyFileTheme(file, persist = true) {
+  function applyFileTheme(file, persist = true, syncFallback = true) {
+    if (!file || suppressExtensions) return false;
+    if (!themeMetadataReady) {
+      pendingFileTheme = { file, persist, syncFallback };
+      return false;
+    }
+    const selected = loadedThemes.get(file);
+    if (!selected || !selected.compatible) {
+      fallbackToHaven(file, true, syncFallback);
+      return false;
+    }
+
     // Clear inline custom-theme vars (from the triangle editor / rgb cycle)
     if (typeof clearCustomVars === 'function') clearCustomVars();
     if (typeof stopRgbCycle === 'function') stopRgbCycle();
@@ -452,50 +868,85 @@ window.HavenPluginLoader = (function () {
     document.getElementById('custom-theme-editor')?._hide?.();
     document.getElementById('rgb-theme-editor')?._hide?.();
 
-    // Remove all previously injected file-theme links
-    document.querySelectorAll('link[id^="haven-theme-"]').forEach(l => l.remove());
-    loadedThemes.forEach((t, f) => { t.enabled = false; t.linkEl = null; });
-
-    // Inject the chosen file
-    const linkEl = document.createElement('link');
-    linkEl.rel = 'stylesheet';
-    linkEl.href = `/themes/${file}?_=${Date.now()}`;
-    linkEl.id = `haven-theme-${file}`;
-    document.head.appendChild(linkEl);
-    const t = loadedThemes.get(file);
-    if (t) { t.enabled = true; t.linkEl = linkEl; }
-
-    // Use 'haven' as the base data-theme so layout CSS is stable;
-    // the injected stylesheet overrides the :root vars since it loads later.
-    document.documentElement.setAttribute('data-theme', 'haven');
-
-    if (persist) {
-      localStorage.setItem('haven_theme', `file:${file}`);
-    }
-
-    // Update active state on all theme buttons
-    document.querySelectorAll('.theme-btn').forEach(b => {
-      b.classList.toggle('active', b.dataset.theme === `file:${file}`);
+    loadedThemes.forEach(t => {
+      t.enabled = false;
+      t.suppressed = false;
+      t.linkEl = null;
     });
 
+    // The link injection, the 'haven' layout base, persistence and the button
+    // active state are shared with the login page, so they live in theme.js and
+    // are called from here rather than written out twice. Everything below this
+    // point is plugin-loader's own bookkeeping, which the login page has no use
+    // for. (#5537)
+    const linkEl = applyPublishedThemeBase(file, persist, selected.meta);
+    if (!linkEl) {
+      fallbackToHaven(file, true, syncFallback);
+      return false;
+    }
+    const t = loadedThemes.get(file);
+    if (t) { t.enabled = true; t.suppressed = false; t.linkEl = linkEl; }
+
+    // Selecting a published theme deselects any other one, so drop the others
+    // from the enabled list. Otherwise the Settings toggles claim a theme is
+    // on while the picker shows a different one as active.
+    const kept = getEnabledThemes().filter(f =>
+      f !== file && !isExclusiveTheme(f) && loadedThemes.get(f)?.compatible !== false
+    );
+    setEnabledThemes([file, ...kept]);
+
     // Re-inject user-enabled custom CSS tweaks (non-published themes) on top of the new base.
-    // The check below skips the file we just injected since it's already in the DOM.
-    reapplyEnabledThemes();
+    reapplyEnabledThemes(file);
+    renderPluginUI();
+
+    // Built-in theme buttons re-run the effect layer on every switch; file themes
+    // have to do the same or the previous theme's overlays (FFX water, Matrix rain,
+    // Nord snow…) keep running on top of the new one. Guarded because theme.js
+    // isn't guaranteed to be loaded wherever the loader runs.
+    if (!suppressExtensions && typeof applyEffects === 'function') {
+      const fxMode = typeof _getStoredEffectMode === 'function' ? _getStoredEffectMode() : 'auto';
+      applyEffects(fxMode);
+    }
+    if (!suppressExtensions && typeof showEffectEditorIfDynamic === 'function') {
+      showEffectEditorIfDynamic(`file:${file}`);
+    }
+    document.documentElement.removeAttribute('data-haven-theme-pending');
+    return true;
   }
 
-  // Re-inject all user-enabled themes that are missing from the DOM.
+  // Re-inject the user-enabled CSS tweaks that are missing from the DOM.
   // Called after any theme switch that removes haven-theme-* links.
-  function reapplyEnabledThemes() {
+  // The active theme is skipped (it was just injected, and re-adding it would
+  // move it after the tweaks meant to override it) and so is every exclusive
+  // palette, which is a selectable theme rather than an overlay.
+  function dropExclusiveThemesFromEnabled(keepFile) {
+    const enabled = getEnabledThemes();
+    const kept = enabled.filter(f => f === keepFile || !isExclusiveTheme(f));
+    if (kept.length !== enabled.length) setEnabledThemes(kept);
+    for (const [file, t] of loadedThemes) {
+      if (file === keepFile) continue;
+      if (!isExclusiveTheme(file)) continue;
+      t.enabled = false;
+      t.linkEl = null;
+    }
+  }
+
+  function reapplyEnabledThemes(activeFile = getActiveFileTheme()) {
+    if (suppressExtensions) return;
+    dropExclusiveThemesFromEnabled(activeFile);
     const enabledList = getEnabledThemes();
     for (const file of enabledList) {
+      if (file === activeFile) continue;
+      if (isExclusiveTheme(file)) continue;
+      const t = loadedThemes.get(file);
+      if (!t?.compatible) continue;
       if (document.getElementById(`haven-theme-${file}`)) continue; // already present
       const linkEl = document.createElement('link');
       linkEl.rel = 'stylesheet';
-      linkEl.href = `/themes/${file}?_=${Date.now()}`;
+      linkEl.href = `/themes/${encodeURIComponent(file)}?_=${Date.now()}`;
       linkEl.id = `haven-theme-${file}`;
       document.head.appendChild(linkEl);
-      const t = loadedThemes.get(file);
-      if (t) { t.enabled = true; t.linkEl = linkEl; }
+      if (t) { t.enabled = true; t.suppressed = false; t.linkEl = linkEl; }
     }
   }
 
@@ -515,7 +966,10 @@ window.HavenPluginLoader = (function () {
     disableTheme,
     renderPluginUI,
     applyFileTheme,
+    selectFileTheme,
+    onThemeRefused,
+    suppressed: suppressExtensions,
     reapplyEnabledThemes,
-    refresh: init,
+    refresh: () => init(true),
   };
 })();

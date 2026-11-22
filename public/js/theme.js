@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// Haven — Shared Theme Switcher (loaded on all pages)
+// Haven: Shared Theme Switcher (loaded on all pages)
 // ═══════════════════════════════════════════════════════════
 
 // ── Color-conversion helpers ────────────────────────────
@@ -17,55 +17,158 @@ function hsvToRgb(h, s, v) {
 }
 function rgbToHex(r, g, b) { return '#' + [r, g, b].map(c => c.toString(16).padStart(2, '0')).join(''); }
 function hsvToHex(h, s, v) { return rgbToHex(...hsvToRgb(h, s, v)); }
+function getAccentTextColor(r, g, b) {
+  // Relative luminance using the WCAG sRGB conversion.
+  function linearize(c) {
+    c /= 255;
+    return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+
+  const luminance = (0.2126 * linearize(r)) + (0.7152 * linearize(g)) + (0.0722 * linearize(b));
+
+  // Choose whichever gives the stronger contrast.
+  const whiteContrast = 1.05 / (luminance + 0.05);
+  const blackContrast = (luminance + 0.05) / 0.05;
+
+  // bias towards white 10%
+  return whiteContrast * 1.1 >= blackContrast ? '#fff' : '#000';
+}
+
+// WCAG contrast between two [r, g, b] colors.
+function _relLuminance(rgb) {
+  const lin = (c) => { c /= 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); };
+  return 0.2126 * lin(rgb[0]) + 0.7152 * lin(rgb[1]) + 0.0722 * lin(rgb[2]);
+}
+function _contrastRatio(a, b) {
+  const la = _relLuminance(a), lb = _relLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+// The brightness of a hue darkened just enough to reach `target` contrast
+// against a background, or as close as it gets.
+function _readableV(h, s, v, bgRgb, target) {
+  let out = v;
+  while (out > 0.2 && _contrastRatio(hsvToRgb(h, s, out), bgRgb) < target) out -= 0.02;
+  return out;
+}
 
 // ── Generate full theme palette from a single HSV accent ─
 // vibrancy: 0-1, controls how much the hue tints backgrounds/text/borders
-function generateCustomPalette(h, s, v, vibrancy) {
+// lightBase: false = dark base, true = light base
+function generateCustomPalette(h, s, v, vibrancy, lightBase, accent) {
   if (vibrancy === undefined) vibrancy = 0.5;
-  const vib = Math.max(0, Math.min(1, vibrancy));
-  const rgb = hsvToRgb(h, s, v);
+  if (lightBase === undefined) lightBase = false;
 
-  // Background saturation scales with vibrancy (0.05 at 0, 0.35 at 1)
-  const bgSat = 0.05 + vib * 0.30;
-  // Border & hover saturation
-  const bdrSat = 0.05 + vib * 0.25;
-  // Text tinting: at high vibrancy, text leans toward the hue
-  const txtS   = vib * 0.12;
-  const txtPri = hsvToHex(h, txtS, 0.90 + vib * 0.05);
-  const txtSec = hsvToHex(h, txtS + 0.02, 0.62 + vib * 0.05);
-  const txtMut = hsvToHex(h, txtS, 0.38 + vib * 0.04);
+  const vib = Math.max(0, Math.min(1, vibrancy));
+  const ac = accent && Number.isFinite(accent.h) && Number.isFinite(accent.s) && Number.isFinite(accent.v) ? accent : { h, s, v };
+  const rgb = hsvToRgb(ac.h, ac.s, ac.v);
+  const bgSat  = lightBase ? 0.01 + vib * 0.05 : 0.05 + vib * 0.30;
+  const bdrSat = lightBase ? 0.02 + vib * 0.08 : 0.05 + vib * 0.25;
+
+  let bgPrimary;
+  let bgSecondary;
+  let bgTertiary;
+  let bgHover;
+  let bgActive;
+  let bgInput;
+  let bgCard;
+
+  let txtPri;
+  let txtSec;
+  let txtMut;
+
+  let border;
+  let borderLight;
+
+  if (lightBase) {
+    bgPrimary   = hsvToHex(h, bgSat,       0.985);
+    bgSecondary = hsvToHex(h, bgSat * 0.85, 0.965);
+    bgTertiary  = hsvToHex(h, bgSat * 0.7,  0.945);
+    bgHover     = hsvToHex(h, bgSat * 0.7,  0.925);
+    bgActive    = hsvToHex(h, bgSat * 0.7,  0.900);
+    bgInput     = hsvToHex(h, bgSat,       0.975);
+    bgCard      = hsvToHex(h, bgSat * 0.85, 0.975);
+
+    // Dark text for the light base.
+    const txtS = vib * 0.08;
+    txtPri = hsvToHex(h, txtS,        0.18);
+    txtSec = hsvToHex(h, txtS + 0.02, 0.38);
+    txtMut = hsvToHex(h, txtS,        0.55);
+
+    // Soft lines like Daylight's; border-light is the lighter one, as in
+    // every other theme.
+    border      = hsvToHex(h, bdrSat, 0.86);
+    borderLight = hsvToHex(h, bdrSat, 0.91);
+  } else {
+    // Text tinting: at high vibrancy, text leans toward the hue.
+    const txtS = vib * 0.12;
+    txtPri = hsvToHex(h, txtS,       0.90 + vib * 0.05);
+    txtSec = hsvToHex(h, txtS + 0.02, 0.62 + vib * 0.05);
+    txtMut = hsvToHex(h, txtS,       0.38 + vib * 0.04);
+    bgPrimary   = hsvToHex(h, bgSat,       0.07 + vib * 0.03);
+    bgSecondary = hsvToHex(h, bgSat * 0.85, 0.09 + vib * 0.04);
+    bgTertiary  = hsvToHex(h, bgSat * 0.7,  0.12 + vib * 0.04);
+    bgHover     = hsvToHex(h, bgSat * 0.7,  0.15 + vib * 0.05);
+    bgActive    = hsvToHex(h, bgSat * 0.7,  0.18 + vib * 0.06);
+    bgInput     = hsvToHex(h, bgSat,       0.05 + vib * 0.03);
+    bgCard      = hsvToHex(h, bgSat * 0.85, 0.08 + vib * 0.04);
+    border      = hsvToHex(h, bdrSat, 0.16 + vib * 0.06);
+    borderLight = hsvToHex(h, bdrSat, 0.21 + vib * 0.06);
+  }
+
+  // On a light base the accent, the link and the status colors are darkened
+  // until they stand out from the background (about 3:1, 4.5:1 for links),
+  // or mentions, links and warnings in yellow, green or cyan all but vanish.
+  let aV = ac.v;
+  let linkV = lightBase ? 0.55 : 0.95;
+  let okV = 0.72, badV = 0.94, warnV = 0.94;
+  // Green, red and amber mean something (online, do not disturb, a warning,
+  // a delete button), so they keep their own hue whatever color is picked.
+  // They used to turn with the picked hue, and a blue theme showed people
+  // who were online with a red dot.
+  const OK_H = 140, BAD_H = 355, WARN_H = 40;
+  if (lightBase) {
+    const bg = hsvToRgb(h, bgSat, 0.985);
+    aV = _readableV(ac.h, ac.s, ac.v, bg, 3);
+    linkV = _readableV((ac.h + 180) % 360, 0.5 + vib * 0.2, linkV, bg, 4.5);
+    okV = _readableV(OK_H, 0.55, okV, bg, 3);
+    badV = _readableV(BAD_H, 0.70, badV, bg, 3);
+    warnV = _readableV(WARN_H, 0.75, warnV, bg, 3);
+  }
 
   return {
-    '--accent':        hsvToHex(h, s, v),
-    '--accent-hover':  hsvToHex(h, Math.max(s - 0.15, 0), Math.min(v + 0.15, 1)),
-    '--accent-dim':    hsvToHex(h, Math.min(s + 0.1, 1), Math.max(v - 0.2, 0)),
-    '--accent-glow':   `rgba(${rgb.join(',')}, ${(0.15 + vib * 0.20).toFixed(2)})`,
-    '--bg-primary':    hsvToHex(h, bgSat, 0.07 + vib * 0.03),
-    '--bg-secondary':  hsvToHex(h, bgSat * 0.85, 0.09 + vib * 0.04),
-    '--bg-tertiary':   hsvToHex(h, bgSat * 0.7, 0.12 + vib * 0.04),
-    '--bg-hover':      hsvToHex(h, bgSat * 0.7, 0.15 + vib * 0.05),
-    '--bg-active':     hsvToHex(h, bgSat * 0.7, 0.18 + vib * 0.06),
-    '--bg-input':      hsvToHex(h, bgSat, 0.05 + vib * 0.03),
-    '--bg-card':       hsvToHex(h, bgSat * 0.85, 0.08 + vib * 0.04),
-    '--text-primary':  txtPri,
+    '--accent':         hsvToHex(ac.h, ac.s, aV),
+    // Black or white button text, whichever reads better, only in light
+    // mode: dark Custom and RGB keep the white text they always had.
+    ...(lightBase ? { '--accent-text': getAccentTextColor(...hsvToRgb(ac.h, ac.s, aV)) } : {}),
+    '--accent-hover':   hsvToHex(ac.h, Math.max(ac.s - 0.15, 0), Math.min(aV + 0.15, 1)),
+    '--accent-dim':     hsvToHex(ac.h, Math.min(ac.s + 0.1, 1), Math.max(aV - 0.2, 0)),
+    '--accent-glow':    `rgba(${rgb.join(',')}, ${(0.15 + vib * 0.20).toFixed(2)})`,
+    '--bg-primary':     bgPrimary,
+    '--bg-secondary':   bgSecondary,
+    '--bg-tertiary':    bgTertiary,
+    '--bg-hover':       bgHover,
+    '--bg-active':      bgActive,
+    '--bg-input':       bgInput,
+    '--bg-card':        bgCard,
+    '--text-primary':   txtPri,
     '--text-secondary': txtSec,
-    '--text-muted':    txtMut,
-    '--text-link':     hsvToHex((h + 180) % 360, 0.5 + vib * 0.2, 0.95),
-    '--border':        hsvToHex(h, bdrSat, 0.16 + vib * 0.06),
-    '--border-light':  hsvToHex(h, bdrSat, 0.21 + vib * 0.06),
-    '--success':       hsvToHex((h + 140) % 360, 0.55, 0.72),
-    '--danger':        hsvToHex((h + 350) % 360, 0.70, 0.94),
-    '--warning':       hsvToHex((h + 50) % 360, 0.75, 0.94),
-    '--led-on':        hsvToHex((h + 140) % 360, 0.55, 0.72),
-    '--led-off':       '#555',
-    '--led-glow':      `rgba(${hsvToRgb((h + 140) % 360, 0.55, 0.72).join(',')}, 0.5)`,
+    '--text-muted':     txtMut,
+    '--text-link':      hsvToHex((ac.h + 180) % 360, 0.5 + vib * 0.2, linkV),
+    '--border':         border,
+    '--border-light':   borderLight,
+    '--success':        hsvToHex(OK_H, 0.55, okV),
+    '--danger':         hsvToHex(BAD_H, 0.70, badV),
+    '--warning':        hsvToHex(WARN_H, 0.75, warnV),
+    '--led-on':         hsvToHex(OK_H, 0.55, 0.72),
+    '--led-off':        '#555',
+    '--led-glow':       `rgba(${hsvToRgb(OK_H, 0.55, 0.72).join(',')}, 0.5)`,
   };
 }
 
 // ── Apply / clear custom theme CSS variables ────────────
 // Sets each CSS custom property directly on :root's inline style.
 // Multiple setProperty calls in one script execution are batched by
-// Chromium into a single style-invalidation pass — no intermediate
+// Chromium into a single style-invalidation pass, with no intermediate
 // recalculations.  This avoids the CSSOM node creation/destruction
 // that happens when writing a <style> element's textContent 20×/s,
 // which was causing progressive Blink Oilpan GC pressure.
@@ -76,17 +179,111 @@ function applyCustomVars(palette) {
   // the next frame, treating them as a single batched invalidation.
   const root = document.documentElement.style;
   for (const [k, v] of Object.entries(palette)) root.setProperty(k, v);
+  // Only light palettes set the button text color; switching back to dark
+  // must not leave the light one behind.
+  if (!('--accent-text' in palette)) root.removeProperty('--accent-text');
+  _cachePalette(palette);
+  // Read from the palette itself: RGB calls this many times a second, too
+  // often to ask the browser for computed styles.
+  _setColorScheme(window.HavenThemeCompat?.colorSchemeFor?.(palette['--bg-primary']));
+}
+
+// theme-init.js paints the first frame from the last palette shown, so a
+// light Custom or RGB theme does not flash dark on every load. Written at
+// most twice a second, since RGB changes colors many times a second.
+let _paletteCacheLatest = null;
+let _paletteCacheTimer = null;
+function _cachePalette(palette) {
+  _paletteCacheLatest = palette;
+  if (_paletteCacheTimer) return;
+  _paletteCacheTimer = setTimeout(() => {
+    _paletteCacheTimer = null;
+    try {
+      const theme = localStorage.getItem('haven_theme');
+      if (theme === 'custom' || theme === 'rgb') {
+        localStorage.setItem('haven_palette_cache', JSON.stringify({ theme, vars: _paletteCacheLatest }));
+      }
+    } catch {
+      // Storage unavailable: the next load computes the colors instead.
+    }
+  }, 500);
 }
 function clearCustomVars() {
   if (_themeStyleEl) { _themeStyleEl.textContent = ''; }
   // Also remove any leftover inline custom properties (legacy path)
-  const keys = ['--accent','--accent-hover','--accent-dim','--accent-glow',
+  const keys = ['--accent','--accent-text','--accent-hover','--accent-dim','--accent-glow',
     '--bg-primary','--bg-secondary','--bg-tertiary','--bg-hover','--bg-active',
     '--bg-input','--bg-card','--text-primary','--text-secondary','--text-muted',
     '--text-link','--border','--border-light','--success','--danger','--warning',
     '--led-on','--led-off','--led-glow'];
   keys.forEach(k => document.documentElement.style.removeProperty(k));
+  scheduleColorSchemeSync();
 }
+
+// ── Light or dark native controls ───────────────────────
+// The list a <select> opens, scrollbars and date pickers are drawn by the
+// browser, which picks light or dark from color-scheme. data-color-scheme on
+// <html> carries the active theme's answer (style-themes.css turns it into
+// color-scheme), worked out from the theme's own --bg-primary, so built-in,
+// published and Custom themes all get it without a list kept by hand.
+// theme-init.js reads the stored copy so the first frame already has it.
+const COLOR_SCHEME_KEY = 'haven_color_scheme';
+let _colorSchemeProbe = null;
+let _colorSchemeTimer = 0;
+
+function _setColorScheme(scheme) {
+  if (scheme !== 'light' && scheme !== 'dark') return;
+  const root = document.documentElement;
+  if (root.getAttribute('data-color-scheme') === scheme) return;
+  root.setAttribute('data-color-scheme', scheme);
+  try {
+    localStorage.setItem(COLOR_SCHEME_KEY, scheme);
+  } catch {
+    // Storage unavailable: the next load works the scheme out again.
+  }
+}
+
+function syncColorScheme() {
+  _colorSchemeTimer = 0;
+  const compat = window.HavenThemeCompat;
+  if (!compat?.colorSchemeFor || !document.body) return;
+  // The browser resolves the token to rgb() on an element, whatever color
+  // syntax the theme wrote it in.
+  if (!_colorSchemeProbe || !_colorSchemeProbe.isConnected) {
+    _colorSchemeProbe = document.createElement('span');
+    _colorSchemeProbe.setAttribute('aria-hidden', 'true');
+    _colorSchemeProbe.setAttribute('data-haven-color-probe', '');
+    _colorSchemeProbe.style.cssText = 'display:none;color:var(--bg-primary)';
+    document.body.appendChild(_colorSchemeProbe);
+  }
+  _setColorScheme(compat.colorSchemeFor(getComputedStyle(_colorSchemeProbe).color));
+}
+
+// A timer rather than an animation frame: frames pause in a hidden window,
+// and a theme switched there would keep the old scheme until shown.
+function scheduleColorSchemeSync() {
+  if (_colorSchemeTimer) return;
+  _colorSchemeTimer = setTimeout(syncColorScheme, 0);
+}
+
+// Built-in themes switch by data-theme; published themes by adding or
+// removing a stylesheet, whose colors only count once it has loaded.
+function _watchColorScheme() {
+  if (typeof MutationObserver === 'function') {
+    const observer = new MutationObserver(scheduleColorSchemeSync);
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+    if (document.head) observer.observe(document.head, { childList: true });
+  }
+  document.addEventListener('load', (e) => {
+    if (e.target?.tagName === 'LINK') scheduleColorSchemeSync();
+  }, true);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', scheduleColorSchemeSync, { once: true });
+  } else {
+    scheduleColorSchemeSync();
+  }
+}
+_watchColorScheme();
 
 // ═══════════════════════════════════════════════════════════
 // RGB CYCLING THEME
@@ -97,23 +294,34 @@ let _rgbLastTick = 0;
 let _rgbLastHueInt = -1;
 let _rgbPaletteLut = null;
 let _rgbPaletteLutVibrancy = -1;
+let _rgbPaletteLutLightBase = false;
 
 function _rebuildRgbPaletteLut(vibrancy) {
   const vib = Math.max(10, Math.min(100, Math.round(vibrancy)));
+  const lightBase = isLightColorBase();
+
   _rgbPaletteLut = new Array(360);
+
   for (let h = 0; h < 360; h += 1) {
-    _rgbPaletteLut[h] = generateCustomPalette(h, 0.75, 0.95, vib / 100);
+    _rgbPaletteLut[h] = generateCustomPalette(h, 0.75, 0.95, vib / 100, lightBase);
   }
   _rgbPaletteLutVibrancy = vib;
+  _rgbPaletteLutLightBase = lightBase;
 }
 
 function _getRgbPalette(hue, vibrancy) {
   const h = Math.round(((hue % 360) + 360) % 360);
   const vib = Math.max(10, Math.min(100, Math.round(vibrancy)));
-  if (!_rgbPaletteLut || _rgbPaletteLutVibrancy !== vib) {
+  const lightBase = isLightColorBase();
+
+  if (!_rgbPaletteLut || _rgbPaletteLutVibrancy !== vib || _rgbPaletteLutLightBase !== lightBase) {
     _rebuildRgbPaletteLut(vib);
   }
-  return { h, palette: _rgbPaletteLut[h] };
+
+  return {
+    h,
+    palette: _rgbPaletteLut[h]
+  };
 }
 
 function startRgbCycle() {
@@ -140,7 +348,8 @@ function startRgbCycle() {
 
   function tick(now) {
     _rgbRAF = requestAnimationFrame(tick);
-    if (document.hidden) {
+    // Reduce motion holds the current colors, the same way a hidden tab does.
+    if (document.hidden || _motionReduced()) {
       _rgbLastTick = now;
       lastFrameTs = now;
       return;
@@ -173,7 +382,7 @@ function startRgbCycle() {
   // workload that freezes the renderer within minutes.
   document.documentElement.classList.add('rgb-cycling');
 
-  // Expose updaters so sliders can adjust live (no restart needed — step recalcs each tick)
+  // Expose updaters so sliders can adjust live (no restart needed; step recalcs each tick)
   startRgbCycle._setSpeed = (v) => {
     speed = v;
     localStorage.setItem('haven_rgb_settings', JSON.stringify({ speed, vibrancy }));
@@ -223,6 +432,34 @@ function initRgbEditor() {
   editor._hide = () => { editor.style.display = 'none'; };
 }
 
+// Read once and kept, since the RGB cycle asks many times a second.
+let _colorBase = null;
+function getColorBase() {
+  if (_colorBase) return _colorBase;
+  try {
+    _colorBase = localStorage.getItem('haven_color_base') === 'light' ? 'light' : 'dark';
+  } catch {
+    _colorBase = 'dark'; // storage unavailable: the dark base
+  }
+  return _colorBase;
+}
+
+function isLightColorBase() {
+  return getColorBase() === 'light';
+}
+
+function setColorBase(base) {
+  const value = base === 'light' ? 'light' : 'dark';
+  _colorBase = value;
+
+  try {
+    localStorage.setItem('haven_color_base', value);
+  } catch {
+    // Storage unavailable; current page still gets the new base.
+  }
+  return value;
+}
+
 // ════════════════════════════════════════════════════════════
 // EFFECT SPEED SLIDERS (per-effect independent speed control)
 // ════════════════════════════════════════════════════════════
@@ -234,9 +471,16 @@ let _fxSpeedMult = 1.0;
 
 // Human-readable labels for effect speed sliders
 const _FX_LABELS = {
-  crt: '📺 CRT', ffx: '⚔️ Water', ice: '🧊 Frost', nord: '❄ Snow',
-  darksouls: '🔥 Embers', bloodborne: '🩸 Blood', matrix: 'Ⅿ Matrix',
-  cyberpunk: '⚡ Glitch', lotr: '⚜ Candle', eldenring: '✨ Golden Grace'
+  crt: () => `📺 ${t('theme_effects.crt')}`,
+  ffx: () => `⚔️ ${t('theme_effects.water')}`,
+  ice: () => `🧊 ${t('theme_effects.frost')}`,
+  nord: () => `❄ ${t('theme_effects.snow')}`,
+  darksouls: () => `🔥 ${t('theme_effects.embers')}`,
+  bloodborne: () => `🩸 ${t('theme_effects.blood')}`,
+  matrix: () => `Ⅿ ${t('theme_effects.matrix')}`,
+  cyberpunk: () => `⚡ ${t('theme_effects.glitch')}`,
+  lotr: () => `⚜ ${t('theme_effects.candle')}`,
+  eldenring: () => `✨ ${t('theme_effects.golden_grace')}`
 };
 
 // Get speed for a specific effect (per-effect → global fallback → 1.0)
@@ -249,7 +493,7 @@ function initEffectSpeedEditor() {
   const editor = document.getElementById('effect-speed-editor');
   if (!editor) return;
 
-  // Restore saved global multiplier (legacy — used as fallback)
+  // Restore saved global multiplier (legacy, used as fallback)
   const saved = parseFloat(localStorage.getItem('haven_fx_mult'));
   if (!isNaN(saved)) {
     document.documentElement.style.setProperty('--fx-mult', saved);
@@ -260,7 +504,7 @@ function initEffectSpeedEditor() {
   try {
     const perEffect = JSON.parse(localStorage.getItem('haven_fx_speeds') || '{}');
     Object.assign(_fxSpeedMap, perEffect);
-  } catch {}
+  } catch { /* corrupt saved speeds: keep the defaults */ }
 
   editor._show = () => { editor.style.display = 'block'; };
   editor._hide = () => { editor.style.display = 'none'; };
@@ -274,13 +518,13 @@ function _rebuildEffectSpeedSliders() {
   // Clear existing sliders
   editor.innerHTML = '';
 
-  // Get active dynamic effects — exclude CRT and Cyberpunk which have dedicated editors
+  // Get active dynamic effects, excluding CRT and Cyberpunk which have dedicated editors
   const DEDICATED_EDITORS = ['crt', 'cyberpunk'];
   const active = [..._activeFx].filter(fx => DYNAMIC_THEMES.includes(fx) && !DEDICATED_EDITORS.includes(fx));
   if (active.length === 0) return;
 
   active.forEach(fx => {
-    const label = _FX_LABELS[fx] || fx;
+    const label = _FX_LABELS[fx]?.() || fx;
     const currentSpeed = _fxSpeedMap[fx] !== undefined ? _fxSpeedMap[fx] : 1.0;
     const sliderVal = Math.round(currentSpeed * 100);
 
@@ -294,7 +538,7 @@ function _rebuildEffectSpeedSliders() {
 
     const slider = row.querySelector('input');
     slider.addEventListener('input', () => {
-      const raw = parseInt(slider.value, 10) / 100; // 0.15–2.0 (canvas: higher = faster)
+      const raw = parseInt(slider.value, 10) / 100; // 0.15-2.0 (canvas: higher = faster)
       _fxSpeedMap[fx] = raw;
 
       // For CSS-based effects: set --fx-mult on overlay layer elements
@@ -319,10 +563,10 @@ function _applyFxSpeedToLayers(effectName, cssMult) {
     layers.forEach(layer => {
       const el = document.getElementById(layer.id);
       if (!el) return;
-      // CRT: widen flicker range — half the slowest speed, double the fastest.
-      // Original --fx-mult ranged 0.15–2.0; new CRT range: 0.075–4.0
+      // CRT: widen flicker range (half the slowest speed, double the fastest).
+      // Original --fx-mult ranged 0.15 to 2.0; new CRT range: 0.075 to 4.0
       if (effectName === 'crt') {
-        const raw = 2.15 - cssMult;                     // 0.15–2.0
+        const raw = 2.15 - cssMult;                     // 0.15-2.0
         const t = (raw - 0.15) / (2.0 - 0.15);         // 0→1 (left→right)
         const crtMult = 4.0 - t * (4.0 - 0.075);       // slow 4.0 → fast 0.075
         el.style.setProperty('--fx-mult', crtMult);
@@ -332,7 +576,7 @@ function _applyFxSpeedToLayers(effectName, cssMult) {
       }
     });
   }
-  // Matrix canvas + matrixbars CSS are paired — speed changes apply to both
+  // Matrix canvas + matrixbars CSS are paired, so speed changes apply to both
   if (effectName === 'matrix') {
     const barLayers = FX_LAYERS['matrixbars'];
     if (barLayers) barLayers.forEach(layer => {
@@ -405,7 +649,7 @@ function initSacredIntensityEditor() {
   }
 
   slider.addEventListener('input', () => {
-    // slider 20-250 → intensity 0.2 – 2.5
+    // slider 20-250 → intensity 0.2-2.5
     const val = parseInt(slider.value, 10) / 100;
     document.documentElement.style.setProperty('--fx-religious-intensity', val);
     localStorage.setItem('haven_fx_sacred_intensity', val);
@@ -436,8 +680,8 @@ let _scrambleTargets = [];  // tracked { el, original } for multi-element scramb
 
 // Layer definitions: each effect -> array of { id, parent, cls }
 const FX_LAYERS = {
-  crt:        [{ id: 'fx-crt-vignette', parent: '#fx-layers', cls: 'fx-crt-vignette' },
-               { id: 'fx-crt-scanlines', parent: '#fx-layers', cls: 'fx-crt-scanlines' }],
+  crt:        [{ id: 'fx-crt-vignette', parent: '#fx-overlay', cls: 'fx-crt-vignette' },
+               { id: 'fx-crt-scanlines', parent: '#fx-overlay', cls: 'fx-crt-scanlines' }],
   matrix:     [],  // digital rain handled entirely by JS canvas
   matrixbars: [{ id: 'fx-matrix-bars', parent: '.sidebar', cls: 'fx-matrix-bars' }],
   fallout:    [{ id: 'fx-fallout-vignette', parent: '#fx-layers', cls: 'fx-fallout-vignette' }],
@@ -471,14 +715,47 @@ const FX_CANVAS = {
   cyberpunk: { start: _startTextScramble, stop: _stopTextScramble }
 };
 
+// Effects are drawn in the chat column, behind its messages (the stacking
+// rules are in style-status-effects.css). Only the CRT screen goes over the
+// whole window, in #fx-overlay.
 function _ensureFxLayers() {
+  const main = document.querySelector('.main');
   let c = document.getElementById('fx-layers');
   if (!c) {
     c = document.createElement('div');
     c.id = 'fx-layers';
+  }
+  if (main && c.parentElement !== main) main.prepend(c);
+  else if (!main && !c.isConnected) document.body.appendChild(c);
+  // Pages without a chat column (sign-in) draw it behind the whole page.
+  c.classList.toggle('fx-layers-page', !main);
+  return c;
+}
+
+function _ensureFxOverlay() {
+  let c = document.getElementById('fx-overlay');
+  if (!c) {
+    c = document.createElement('div');
+    c.id = 'fx-overlay';
     document.body.appendChild(c);
   }
   return c;
+}
+
+// The particle canvases match the chat column, which changes size without
+// the window doing so (the member list, the thread panel beside it).
+const _fxResizers = new Set();
+let _fxResizeObserver = null;
+function _fxWatchSize(canvas, resize) {
+  _fxResizers.add({ canvas, resize });
+  if (_fxResizeObserver || typeof ResizeObserver !== 'function') return;
+  _fxResizeObserver = new ResizeObserver(() => {
+    for (const r of _fxResizers) {
+      if (!r.canvas.isConnected) { _fxResizers.delete(r); continue; }
+      r.resize();
+    }
+  });
+  _fxResizeObserver.observe(_ensureFxLayers());
 }
 
 function _activateEffect(name) {
@@ -491,12 +768,13 @@ function _activateEffect(name) {
   // Overlay layers
   (FX_LAYERS[name] || []).forEach(layer => {
     if (document.getElementById(layer.id)) return;
-    const parent = layer.parent === '#fx-layers'
-      ? _ensureFxLayers()
+    const own = layer.parent === '#fx-layers' || layer.parent === '#fx-overlay';
+    const parent = layer.parent === '#fx-layers' ? _ensureFxLayers()
+      : layer.parent === '#fx-overlay' ? _ensureFxOverlay()
       : document.querySelector(layer.parent);
     if (!parent) return;
     // Ensure parent is positioned
-    if (layer.parent !== '#fx-layers') {
+    if (!own) {
       const pos = getComputedStyle(parent).position;
       if (pos === 'static') parent.style.position = 'relative';
     }
@@ -538,16 +816,27 @@ function _deactivateAllEffects() {
   [..._activeFx].forEach(_deactivateEffect);
 }
 
-function applyEffects(mode) {
+// Settings > Accessibility > Reduce motion (or the OS asking for it) puts
+// .reduce-motion on <html>; see theme-init.js.
+function _motionReduced() {
+  return document.documentElement.classList.contains('reduce-motion');
+}
+
+let _lastEffectsArgs = null;
+
+function applyEffects(mode, themeOverride) {
+  _lastEffectsArgs = [mode, themeOverride];
   _deactivateAllEffects();
 
-  // Always strip theme pseudo-element effects — JS manages all overlays now
+  // Always strip theme pseudo-element effects; JS manages all overlays now
   document.documentElement.setAttribute('data-fx-custom', '');
 
-  if (mode === 'none') return;
+  // Reduced motion runs no effects at all. The choice itself is untouched, so
+  // they come back as they were when motion is allowed again.
+  if (mode === 'none' || _motionReduced()) return;
 
   if (mode === 'auto') {
-    const theme = localStorage.getItem('haven_theme') || 'haven';
+    const theme = themeOverride || localStorage.getItem('haven_theme') || 'haven';
     const defaults = THEME_DEFAULT_FX[theme];
     if (defaults) defaults.forEach(_activateEffect);
     return;
@@ -557,7 +846,13 @@ function applyEffects(mode) {
   if (Array.isArray(mode)) mode.forEach(_activateEffect);
 }
 
-// ── Cyberpunk Text Scramble — decodes text with random chars ─
+// Reduce motion can flip while the page is open (the setting, or the OS
+// setting it follows), so redo the last effects pass when it does.
+document.addEventListener('haven:reduce-motion-change', () => {
+  if (_lastEffectsArgs) applyEffects(..._lastEffectsArgs);
+});
+
+// ── Cyberpunk Text Scramble: decodes text with random chars ─
 const _SCRAMBLE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@#$%&*!?<>{}[]=/\\|~^';
 
 function _scrambleElement(el, original) {
@@ -615,7 +910,7 @@ function _collectScrambleTargets() {
     targets.push({ el, original });
   }
 
-  // 1. Brand text (HAVEN logo) — always included
+  // 1. Brand text (HAVEN logo), always included
   addTarget(document.querySelector('.brand-text'));
 
   // 2. Current username
@@ -624,12 +919,14 @@ function _collectScrambleTargets() {
   // 3. Channel names in sidebar
   document.querySelectorAll('.channel-name').forEach(addTarget);
 
-  // 4. Section labels — target the text span inside toggle headers to avoid
+  // 4. Section labels: target the text span inside toggle headers to avoid
   //    destroying child elements (buttons, badges) via textContent assignment.
   //    For section labels that contain a .section-label-text span, scramble that;
   //    otherwise fall back to the label itself (safe for simple labels).
   document.querySelectorAll('.section-label').forEach(el => {
-    const textSpan = el.querySelector('.section-label-text');
+    // A category header keeps its name in .cat-name, which changes between
+    // the full and the short name as it opens and closes (#5761).
+    const textSpan = el.querySelector('.section-label-text, .cat-name');
     addTarget(textSpan || el);
   });
 
@@ -822,7 +1119,7 @@ function _injectCrtSliders(parentEditor) {
   _applyCrtScanline(scanVal);
 }
 
-// ── Matrix Digital Rain (canvas) — scoped to .main area ─
+// ── Matrix Digital Rain (canvas), scoped to .main area ─
 function _startMatrixRain() {
   _stopMatrixRain();
   const mainEl = document.querySelector('.main');
@@ -839,7 +1136,7 @@ function _startMatrixRain() {
   canvas.style.width = '100%';
   canvas.style.height = '100%';
   canvas.style.pointerEvents = 'none';
-  canvas.style.zIndex = '0';
+  canvas.style.zIndex = '-1'; // behind the chat, like the other effects
   canvas.style.opacity = '0.18';
   mainEl.insertBefore(canvas, mainEl.firstChild);
 
@@ -923,9 +1220,10 @@ function _startEmbers() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _emberCtx = canvas.getContext('2d');
@@ -1015,7 +1313,7 @@ function _stopEmbers() {
   _embers = [];
 }
 
-// ── Elden Ring Grace Embers (canvas — golden, angular, stable glow) ──
+// ── Elden Ring Grace Embers (canvas: golden, angular, stable glow) ──
 function _startGraceEmbers() {
   _stopGraceEmbers();
   const container = _ensureFxLayers();
@@ -1026,9 +1324,10 @@ function _startGraceEmbers() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _graceCtx = canvas.getContext('2d');
@@ -1047,7 +1346,7 @@ function _startGraceEmbers() {
       size: 0.5 + Math.random() * 1.2,
       life: 1,
       decay: 0.002 + Math.random() * 0.005,       // longer life than DS embers
-      hue: 42 + Math.random() * 16,               // golden-yellow (42–58)
+      hue: 42 + Math.random() * 16,               // golden-yellow (42-58)
       phase: Math.random() * Math.PI * 2,
       driftAmp: 0.05 + Math.random() * 0.12,      // very subtle sway
       angle: Math.random() * Math.PI * 2           // rotation for diamond shape
@@ -1103,7 +1402,7 @@ function _startGraceEmbers() {
       _graceCtx.fillStyle = 'hsl(' + e.hue + ',85%,' + Math.floor(lightness) + '%)';
       drawDiamond(_graceCtx, e.x, e.y, sz, e.angle);
 
-      // Soft golden glow (tall, stable — no wild flickering)
+      // Soft golden glow (tall, stable, no wild flickering)
       _graceCtx.globalAlpha = alpha * 0.25;
       _graceCtx.save();
       _graceCtx.translate(e.x, e.y);
@@ -1132,7 +1431,7 @@ function _stopGraceEmbers() {
   _graceEmbers = [];
 }
 
-// ── Nord Snowfall (canvas — randomised, fleeting) ───────
+// ── Nord Snowfall (canvas: randomised, fleeting) ───────
 function _startNordSnow() {
   _stopNordSnow();
   const container = _ensureFxLayers();
@@ -1143,9 +1442,10 @@ function _startNordSnow() {
   container.appendChild(canvas);
 
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.width = container.clientWidth || window.innerWidth;
+    canvas.height = container.clientHeight || window.innerHeight;
   }
+  _fxWatchSize(canvas, resize);
   resize();
 
   _snowCtx = canvas.getContext('2d');
@@ -1173,7 +1473,7 @@ function _startNordSnow() {
     _snowLastFrame = now;
     _snowCtx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Spawn snowflakes at random intervals — density scales with width
+    // Spawn snowflakes at random intervals; density scales with width
     // Speed multiplier affects spawn rate and fall speed
     const speedM = _getFxSpeed('nord');
     const targetCount = Math.max(20, Math.floor(canvas.width / 18 * Math.max(0.5, speedM)));
@@ -1203,7 +1503,7 @@ function _startNordSnow() {
         continue;
       }
 
-      // Draw snowflake — soft circle with glow
+      // Draw snowflake: soft circle with glow
       _snowCtx.globalAlpha = alpha;
       _snowCtx.fillStyle = '#d8dee9';
       _snowCtx.beginPath();
@@ -1242,7 +1542,7 @@ function _getStoredEffectMode() {
   try {
     const parsed = JSON.parse(stored);
     if (Array.isArray(parsed)) return parsed;
-  } catch(e) {}
+  } catch(e) { /* not JSON: handled as the legacy single-effect value below */ }
   // Legacy: single effect string from old system → convert to array
   if (typeof stored === 'string' && stored.length > 0 && stored !== 'auto' && stored !== 'none') {
     const arr = [stored];
@@ -1279,6 +1579,107 @@ function _updateEffectButtons(container, mode) {
   });
 }
 
+// Effects used to live only in localStorage. The desktop app can land on a
+// different storage origin between launches (http vs https autodetect), and
+// hardened browsers wipe local storage, so the pick came back as the theme's
+// defaults while the theme itself survived through the server. Mirror the
+// choice to user_preferences the way theme does.
+function _persistEffects(raw) {
+  localStorage.setItem('haven_effects', raw);
+  // The app's socket is window.havenSocket: app.js is a module, so there is
+  // no global `socket`, and checking for one meant this never sent anything.
+  const socket = window.havenSocket;
+  if (socket && socket.connected) {
+    socket.emit('set-preference', { key: 'effects', value: raw });
+  }
+}
+
+// Called from the socket 'preferences' handler before the theme is applied,
+// so the theme pass picks the restored effects up in the same go.
+function syncEffectsFromServer(raw) {
+  if (typeof raw !== 'string' || !raw) return;
+  try { localStorage.setItem('haven_effects', raw); } catch (e) { /* storage blocked (private mode): nothing is remembered, nothing else breaks */ }
+  const container = document.getElementById('effect-selector');
+  if (container) _updateEffectButtons(container, _getStoredEffectMode());
+}
+
+function _layoutPlugin(file) {
+  return window.HavenPluginLoader?.loadedPlugins?.get(file)?.instance;
+}
+
+function _setLayoutPlugin(file, on, dataKey) {
+  try {
+    window.HavenApi?.Data?.save(dataKey, 'layoutOn', on ? '1' : '0');
+  } catch (err) { console.warn('[Theme] could not save the layout toggle', err); }
+  if (on) window.HavenPluginLoader?.enablePlugin?.(file);
+  const inst = _layoutPlugin(file);
+  if (on) inst?._engage?.();
+  else inst?._disengage?.();
+}
+
+// ── Layout picker ──
+// Original is Haven's own layout. Every other choice is a layout plugin on
+// this server: a file named <Name>Layout.plugin.js whose instance has
+// _engage() and _disengage(), takes the shared layout with
+// HavenApi.Layout.acquire('<Name>Layout') and keeps its on/off under that
+// same name, as Braid and Compact do. Only one is on at a time, and a new
+// layout shows up here without any change to Haven itself.
+function _layoutPluginFiles() {
+  const loaded = window.HavenPluginLoader?.loadedPlugins;
+  if (!loaded) return [];
+  return [...loaded.entries()]
+    .filter(([file, p]) => /Layout\.plugin\.js$/.test(file) && !p.suppressed)
+    .map(([file, p]) => ({ file, key: file.replace('.plugin.js', ''), name: String(p.meta?.name || file).replace(/\s*layout$/i, '') }));
+}
+
+// The layout the person picked: the one running now, or else an enabled
+// layout plugin that is switched on but waiting (Compact only runs in a
+// window at least 901px wide, Braid waits while Mod Mode edits).
+function _activeLayoutKey() {
+  const owner = document.documentElement.getAttribute('data-haven-layout-owner');
+  if (owner) return owner;
+  const loaded = window.HavenPluginLoader?.loadedPlugins;
+  for (const l of _layoutPluginFiles()) {
+    if (!loaded?.get(l.file)?.enabled) continue;
+    let on = '0';
+    try { on = window.HavenApi?.Data?.load(l.key, 'layoutOn', '1'); }
+    catch (err) { console.warn('[Theme] could not read the layout choice', err); }
+    if (on !== '0') return l.key;
+  }
+  return '';
+}
+
+function _setLayout(key) {
+  const layouts = _layoutPluginFiles();
+  for (const l of layouts) if (l.key !== key) _setLayoutPlugin(l.file, false, l.key);
+  const chosen = layouts.find(l => l.key === key);
+  if (chosen) _setLayoutPlugin(chosen.file, true, chosen.key);
+  _renderLayoutPicker();
+}
+
+function _renderLayoutPicker() {
+  const picker = document.getElementById('layout-picker');
+  if (!picker) return;
+  const active = _activeLayoutKey();
+  const original = picker.querySelector('[data-layout=""]');
+  picker.querySelectorAll('[data-layout]:not([data-layout=""])').forEach(b => b.remove());
+  for (const l of _layoutPluginFiles()) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'layout-opt';
+    btn.dataset.layout = l.key;
+    btn.setAttribute('role', 'radio');
+    btn.textContent = l.name;
+    picker.appendChild(btn);
+  }
+  picker.querySelectorAll('[data-layout]').forEach(b => {
+    const on = b.dataset.layout === active;
+    b.classList.toggle('active', on);
+    b.setAttribute('aria-checked', String(on));
+  });
+  if (original && !original.isConnected) picker.prepend(original);
+}
+
 function initEffectSelector() {
   const container = document.getElementById('effect-selector');
   if (!container) return;
@@ -1287,16 +1688,33 @@ function initEffectSelector() {
   applyEffects(mode);
   _updateEffectButtons(container, mode);
 
+  const layoutPicker = document.getElementById('layout-picker');
+  if (layoutPicker && !layoutPicker.dataset.bound) {
+    layoutPicker.dataset.bound = '1';
+    layoutPicker.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-layout]');
+      if (btn) _setLayout(btn.dataset.layout);
+    });
+    _renderLayoutPicker();
+  }
+  if (!document.documentElement.dataset.layoutTogglesBound) {
+    document.documentElement.dataset.layoutTogglesBound = '1';
+    // A layout switched some other way (Braid's Ctrl+Shift+B, its own menu,
+    // Mod Mode) and plugins finishing loading both update the picker.
+    document.addEventListener('haven:layout-owner-change', _renderLayoutPicker);
+    document.addEventListener('haven:plugins-loaded', _renderLayoutPicker);
+  }
+
   container.querySelectorAll('.effect-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const fx = btn.dataset.effect;
 
       if (fx === 'auto') {
-        localStorage.setItem('haven_effects', 'auto');
+        _persistEffects('auto');
         applyEffects('auto');
         _updateEffectButtons(container, 'auto');
       } else if (fx === 'none') {
-        localStorage.setItem('haven_effects', 'none');
+        _persistEffects('none');
         applyEffects('none');
         _updateEffectButtons(container, 'none');
       } else {
@@ -1310,11 +1728,11 @@ function initEffectSelector() {
         }
 
         if (current.length === 0) {
-          localStorage.setItem('haven_effects', 'none');
+          _persistEffects('none');
           applyEffects('none');
           _updateEffectButtons(container, 'none');
         } else {
-          localStorage.setItem('haven_effects', JSON.stringify(current));
+          _persistEffects(JSON.stringify(current));
           applyEffects(current);
           _updateEffectButtons(container, current);
         }
@@ -1387,118 +1805,146 @@ function drawTriangle(ctx, w, h, hue, selS, selV) {
   ctx.strokeStyle = '#000'; ctx.lineWidth = 1; ctx.stroke();
 }
 
-// ── Initialise the custom-theme triangle editor ─────────
-function initCustomThemeEditor() {
-  const editor = document.getElementById('custom-theme-editor');
-  if (!editor) return;
-
-  const hueCanvas  = document.getElementById('custom-hue-bar');
-  const triCanvas  = document.getElementById('custom-triangle');
-  if (!hueCanvas || !triCanvas) return;
-
+function makeHsvPicker(hueCanvas, triCanvas, start, onChange) {
   const hueCtx = hueCanvas.getContext('2d');
   const triCtx = triCanvas.getContext('2d');
-
-  const saved = JSON.parse(localStorage.getItem('haven_custom_hsv') || 'null');
-  let hue = saved ? saved.h : 260;
-  let sat = saved ? saved.s : 0.75;
-  let val = saved ? saved.v : 0.95;
-
-  function redrawHue() { drawHueBar(hueCtx, hueCanvas.width, hueCanvas.height, hue); }
-  function redrawTri()  { drawTriangle(triCtx, triCanvas.width, triCanvas.height, hue, sat, val); }
-
-  function apply() {
-    const palette = generateCustomPalette(hue, sat, val, sat);
-    applyCustomVars(palette);
-    localStorage.setItem('haven_custom_hsv', JSON.stringify({ h: hue, s: sat, v: val }));
-    const swatch = document.getElementById('custom-theme-swatch');
-    if (swatch) swatch.style.background = palette['--accent'];
-  }
-
-  function render() { redrawHue(); redrawTri(); apply(); }
-
-  function hueFromEvent(e) {
-    const r = hueCanvas.getBoundingClientRect();
-    const x = Math.max(0, Math.min((e.clientX ?? e.touches[0].clientX) - r.left, r.width));
-    hue = (x / r.width) * 360;
-    render();
-  }
-  let hueDrag = false;
-  hueCanvas.addEventListener('mousedown',  (e) => { hueDrag = true; hueFromEvent(e); });
-  window.addEventListener('mousemove',     (e) => { if (hueDrag) hueFromEvent(e); });
-  window.addEventListener('mouseup',       ()  => { hueDrag = false; });
-  hueCanvas.addEventListener('touchstart', (e) => { e.preventDefault(); hueFromEvent(e); });
-  hueCanvas.addEventListener('touchmove',  (e) => { e.preventDefault(); hueFromEvent(e); });
-
+  const c = { h: start.h, s: start.s, v: start.v };
   const pad = 8;
   const tw = triCanvas.width, th = triCanvas.height;
   const ax = tw / 2, ay = pad, bx = pad, by = th - pad, cx = tw - pad, cy = th - pad;
-
-  function triFromEvent(e) {
+  const redraw = () => { drawHueBar(hueCtx, hueCanvas.width, hueCanvas.height, c.h); drawTriangle(triCtx, tw, th, c.h, c.s, c.v); };
+  const point = (e) => ({ x: e.clientX ?? e.touches[0].clientX, y: e.clientY ?? e.touches[0].clientY });
+  const fromHue = (e) => {
+    const r = hueCanvas.getBoundingClientRect();
+    c.h = (Math.max(0, Math.min(point(e).x - r.left, r.width)) / r.width) * 360;
+    redraw();
+    onChange(c);
+  };
+  const fromTri = (e) => {
     const r = triCanvas.getBoundingClientRect();
-    const ex = (e.clientX ?? e.touches[0].clientX) - r.left;
-    const ey = (e.clientY ?? e.touches[0].clientY) - r.top;
-    const px = ex * (tw / r.width), py = ey * (th / r.height);
-    const bc = bary(px, py, ax, ay, bx, by, cx, cy);
+    const bc = bary((point(e).x - r.left) * (tw / r.width), (point(e).y - r.top) * (th / r.height), ax, ay, bx, by, cx, cy);
     let u = Math.max(0, bc.u), v = Math.max(0, bc.v), w = Math.max(0, bc.w);
     const sum = u + v + w; u /= sum; v /= sum; w /= sum;
-    val = Math.max(0.01, u + v);
-    sat = val > 0 ? u / val : 0;
-    render();
+    c.v = Math.max(0.01, u + v);
+    c.s = c.v > 0 ? u / c.v : 0;
+    redraw();
+    onChange(c);
+  };
+  const drag = (canvas, handler) => {
+    let on = false;
+    canvas.addEventListener('mousedown', (e) => { on = true; handler(e); });
+    window.addEventListener('mousemove', (e) => { if (on) handler(e); });
+    window.addEventListener('mouseup', () => { on = false; });
+    canvas.addEventListener('touchstart', (e) => { e.preventDefault(); handler(e); });
+    canvas.addEventListener('touchmove', (e) => { e.preventDefault(); handler(e); });
+  };
+  drag(hueCanvas, fromHue);
+  drag(triCanvas, fromTri);
+  redraw();
+  return { color: c, redraw, set: (n) => { Object.assign(c, { h: n.h, s: n.s, v: n.v }); redraw(); } };
+}
+
+function initCustomThemeEditor() {
+  const editor = document.getElementById('custom-theme-editor');
+  if (!editor) return;
+  const hueCanvas = document.getElementById('custom-hue-bar');
+  const triCanvas = document.getElementById('custom-triangle');
+  if (!hueCanvas || !triCanvas) return;
+  const saved = JSON.parse(localStorage.getItem('haven_custom_hsv') || 'null');
+  const start = saved || { h: 260, s: 0.75, v: 0.95 };
+  const savedAccent = saved && saved.a && Number.isFinite(saved.a.h) && Number.isFinite(saved.a.s) && Number.isFinite(saved.a.v) ? saved.a : null;
+  const toggle = document.getElementById('custom-accent-toggle');
+  const box = document.getElementById('custom-accent-picker');
+  const accentHue = document.getElementById('custom-accent-hue-bar');
+  const accentTri = document.getElementById('custom-accent-triangle');
+  const hasAccent = !!(toggle && box && accentHue && accentTri);
+  let separate = !!savedAccent;
+  let accentChosen = separate;
+  const paintSwatch = (palette) => { const swatch = document.getElementById('custom-theme-swatch'); if (swatch) swatch.style.background = palette['--accent']; };
+  const current = () => ({ h: main.color.h, s: main.color.s, v: main.color.v, ...(separate ? { a: accent ? { h: accent.color.h, s: accent.color.s, v: accent.color.v } : savedAccent } : {}) });
+  const apply = () => {
+    const hsv = current();
+    const palette = generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s, isLightColorBase(), hsv.a);
+    applyCustomVars(palette);
+    localStorage.setItem('haven_custom_hsv', JSON.stringify(hsv));
+    paintSwatch(palette);
+  };
+  const main = makeHsvPicker(hueCanvas, triCanvas, start, apply);
+  const accent = hasAccent ? makeHsvPicker(accentHue, accentTri, savedAccent || start, () => { accentChosen = true; apply(); }) : null;
+  if (hasAccent) {
+    toggle.checked = separate;
+    box.style.display = separate ? 'block' : 'none';
+    toggle.addEventListener('change', () => {
+      separate = toggle.checked;
+      box.style.display = separate ? 'block' : 'none';
+      if (separate && !accentChosen) accent.set(main.color);
+      if (separate) accent.redraw();
+      apply();
+    });
   }
-  let triDrag = false;
-  triCanvas.addEventListener('mousedown',  (e) => { triDrag = true; triFromEvent(e); });
-  window.addEventListener('mousemove',     (e) => { if (triDrag) triFromEvent(e); });
-  window.addEventListener('mouseup',       ()  => { triDrag = false; });
-  triCanvas.addEventListener('touchstart', (e) => { e.preventDefault(); triFromEvent(e); });
-  triCanvas.addEventListener('touchmove',  (e) => { e.preventDefault(); triFromEvent(e); });
-
-  render();
-
-  editor._show = () => { editor.style.display = 'block'; render(); };
+  paintSwatch(generateCustomPalette(main.color.h, main.color.s, main.color.v, main.color.s, isLightColorBase(), current().a));
+  editor._show = () => { editor.style.display = 'block'; main.redraw(); accent?.redraw(); apply(); };
   editor._hide = () => { editor.style.display = 'none'; };
 }
 
 // ────────────────────────────────────────────────────────
 // Main theme-switcher init (shared on all pages)
 // ────────────────────────────────────────────────────────
+function _isHavenSafeMode() {
+  if (document.documentElement.hasAttribute('data-haven-safe-mode')) return true;
+  return window.HavenThemeCompat?.isSafeMode?.(window.location) === true;
+}
+
+function _isThemeRecoveryPending() {
+  if (window.HavenThemeCompat?.isResetPending?.() === true) return true;
+  try { return sessionStorage.getItem('haven_customizations_reset_pending') === '1'; } catch { return false; }
+}
+
+function _isFileThemeCompatible(meta) {
+  return !!meta && meta.compatible !== false
+    && meta.compatibility !== 'invalid'
+    && meta.compatibility !== 'unsupported';
+}
+
 function initThemeSwitcher(containerId, socket) {
   const container = document.getElementById(containerId);
   if (!container) return;
 
-  const saved = localStorage.getItem('haven_theme') || 'haven';
+  const recoveryMode = _isHavenSafeMode() || _isThemeRecoveryPending();
+  const saved = recoveryMode ? 'haven' : (localStorage.getItem('haven_theme') || 'haven');
   const customEditor = document.getElementById('custom-theme-editor');
   const rgbEditor    = document.getElementById('rgb-theme-editor');
 
   // If custom was saved, apply vars immediately
   if (saved === 'custom') {
     const hsv = JSON.parse(localStorage.getItem('haven_custom_hsv') || 'null');
-    if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s));
+    if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s, isLightColorBase(), hsv.a));
   }
   // If rgb was saved, start cycling
   if (saved === 'rgb') {
     startRgbCycle();
   }
   // File themes are restored by plugin-loader after it fetches theme metadata.
-  // Nothing to do here for 'file:...' — it will be handled once the loader runs.
+  // Nothing to do here for 'file:...'; it will be handled once the loader runs.
 
-  // Set active button (file: theme buttons are injected later by plugin-loader,
-  // so they will pick up the active state via injectPublishedThemeButtons)
+  // Set active button (theme files get theirs from the theme picker, which
+  // draws their cards once plugin-loader has the theme list)
   container.querySelectorAll('.theme-btn').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.theme === saved);
+    if (recoveryMode) btn.disabled = true;
 
     btn.addEventListener('click', () => {
+      if (_isHavenSafeMode() || _isThemeRecoveryPending()) return;
       const theme = btn.dataset.theme;
 
-      // Switching to a built-in theme: remove any injected file-theme links
+      localStorage.setItem('haven_theme', theme);
       if (!theme.startsWith('file:')) {
         document.querySelectorAll('link[id^="haven-theme-"]').forEach(l => l.remove());
-        // Re-inject user-enabled custom CSS tweaks that survived the theme switch
         window.HavenPluginLoader?.reapplyEnabledThemes?.();
+        window.HavenPluginLoader?.renderPluginUI?.();
       }
 
       document.documentElement.setAttribute('data-theme', theme.startsWith('file:') ? 'haven' : theme);
-      localStorage.setItem('haven_theme', theme);
 
       document.querySelectorAll('.theme-btn').forEach(b => {
         b.classList.toggle('active', b.dataset.theme === theme);
@@ -1513,7 +1959,7 @@ function initThemeSwitcher(containerId, socket) {
 
       if (theme === 'custom') {
         const hsv = JSON.parse(localStorage.getItem('haven_custom_hsv') || 'null');
-        if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s));
+        if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s, isLightColorBase(), hsv.a));
         if (customEditor && customEditor._show) customEditor._show();
         if (rgbEditor && rgbEditor._hide) rgbEditor._hide();
       } else if (theme === 'rgb') {
@@ -1533,9 +1979,45 @@ function initThemeSwitcher(containerId, socket) {
     });
   });
 
+  function initColorBaseToggles() {
+    const toggles = document.querySelectorAll('[data-color-base-toggle]');
+    if (!toggles.length) return;
+
+    const sync = () => {
+      const light = isLightColorBase();
+      toggles.forEach(toggle => { toggle.checked = light; });
+    };
+
+    toggles.forEach(toggle => {
+      toggle.addEventListener('change', () => {
+        setColorBase(toggle.checked ? 'light' : 'dark');
+
+        // Keep both Custom and RGB controls synchronized.
+        sync();
+
+        const theme = localStorage.getItem('haven_theme') || 'haven';
+
+        if (theme === 'custom') {
+          const hsv = JSON.parse(
+            localStorage.getItem('haven_custom_hsv') || 'null'
+          );
+
+          if (hsv) {
+            applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s, isLightColorBase(), hsv.a));
+          }
+        } else if (theme === 'rgb') {
+          if (typeof stopRgbCycle === 'function') stopRgbCycle();
+          if (typeof startRgbCycle === 'function') startRgbCycle();
+        }
+      });
+    });
+    sync();
+  }
+
   // Initialise editors
   initCustomThemeEditor();
   initRgbEditor();
+  initColorBaseToggles();
   initEffectSpeedEditor();
   initSacredIntensityEditor();
   initGlitchFreqEditor();
@@ -1552,30 +2034,41 @@ function initThemeSwitcher(containerId, socket) {
   showEffectEditorIfDynamic(saved);
 }
 
-function applyThemeFromServer(theme) {
+// `persist` is on by default because the app page applies the server default
+// on every connect, so re-storing it there keeps the two in step. The login
+// page passes false: it re-reads the default on each visit, and storing it
+// would freeze the first default a visitor ever saw. (#5536)
+function applyThemeFromServer(theme, persist = true, syncFallback = false) {
   if (!theme) return;
+  if (_isHavenSafeMode() || _isThemeRecoveryPending()) return;
 
-  // File theme — delegate to plugin-loader if available; otherwise fall back to haven
+  // File theme: delegate to plugin-loader if available; otherwise fall back to haven
   if (theme.startsWith('file:')) {
     const file = theme.slice(5);
     if (window.HavenPluginLoader?.applyFileTheme) {
-      window.HavenPluginLoader.applyFileTheme(file);
+      window.HavenPluginLoader.applyFileTheme(file, persist, syncFallback);
     } else {
-      // Loader not ready yet — store it; loader will restore on init
+      // Loader not ready yet: store it; loader will restore on init
       localStorage.setItem('haven_theme', theme);
     }
     return;
   }
 
   document.documentElement.setAttribute('data-theme', theme);
-  localStorage.setItem('haven_theme', theme);
+  if (persist) localStorage.setItem('haven_theme', theme);
+  // A built-in theme replaces a file theme still on the page (the pre-paint
+  // copy from theme-init.js included), as a picker click does, so the page
+  // and the Settings toggles both show the theme the account has saved.
+  document.querySelectorAll('link[id^="haven-theme-"]').forEach(l => l.remove());
+  window.HavenPluginLoader?.reapplyEnabledThemes?.(null);
+  window.HavenPluginLoader?.renderPluginUI?.();
   document.querySelectorAll('.theme-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.theme === theme);
   });
   stopRgbCycle();
   if (theme === 'custom') {
     const hsv = JSON.parse(localStorage.getItem('haven_custom_hsv') || 'null');
-    if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s));
+    if (hsv) applyCustomVars(generateCustomPalette(hsv.h, hsv.s, hsv.v, hsv.s, isLightColorBase(), hsv.a));
     const editor = document.getElementById('custom-theme-editor');
     if (editor && editor._show) editor._show();
   } else if (theme === 'rgb') {
@@ -1592,6 +2085,115 @@ function applyThemeFromServer(theme) {
   }
   // Re-apply effects for new theme
   const fxMode = _getStoredEffectMode();
-  applyEffects(fxMode);
+  applyEffects(fxMode, theme);
   showEffectEditorIfDynamic(theme);
+}
+
+// ═══════════════════════════════════════════════════════════
+// Published (file:) themes, shared with the login page
+// ═══════════════════════════════════════════════════════════
+// A published theme is a .theme.css file rather than a built-in data-theme
+// value, so applying it means injecting a stylesheet. These helpers live here
+// because theme.js is the file every page loads, the login page too. (#5537)
+
+// Inject a published theme's stylesheet and make it the active theme. Just
+// that: plugin-loader's applyFileTheme() calls it and does its own extra work.
+function applyPublishedThemeBase(file, persist = true, meta = null) {
+  if (!file || _isHavenSafeMode() || _isThemeRecoveryPending()) return null;
+  const compatibility = meta || window.HavenThemeCompat?.getCachedTheme?.(file);
+  if (!_isFileThemeCompatible(compatibility)) return null;
+  // The theme on screen stays until the new sheet has loaded, so a switch
+  // never flashes the bare Haven base. The old sheets are renamed at once, so
+  // a lookup by theme id already treats them as gone.
+  const stale = [...document.querySelectorAll('link[id^="haven-theme-"]')];
+  stale.forEach((link, i) => { link.id = `haven-theme-stale-${i}-${Date.now()}`; });
+  const linkEl = document.createElement('link');
+  linkEl.rel = 'stylesheet';
+  linkEl.href = `/themes/${encodeURIComponent(file)}?_=${Date.now()}`;
+  linkEl.id = `haven-theme-${file}`;
+  // 'haven' is the stable layout base; the sheet loads after it and overrides the :root variables.
+  const settle = () => {
+    stale.forEach(link => link.remove());
+    if (linkEl.isConnected) document.documentElement.setAttribute('data-theme', 'haven');
+  };
+  ['load', 'error'].forEach(type => linkEl.addEventListener(type, settle, { once: true }));
+  document.head.appendChild(linkEl);
+
+  if (persist) {
+    try { localStorage.setItem('haven_theme', `file:${file}`); } catch { /* storage blocked (private mode): nothing is remembered, nothing else breaks */ }
+  }
+
+  document.querySelectorAll('.theme-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.theme === `file:${file}`);
+  });
+  return linkEl;
+}
+
+// Draw a button for every published theme into an existing theme bar.
+// `onPick` lets the caller add its own behaviour (the app page tells the
+// server about the choice; the login page has no socket to tell).
+function injectPublishedThemeBar(container, themes, onPick) {
+  const el = typeof container === 'string' ? document.getElementById(container) : container;
+  if (!el || !Array.isArray(themes)) return;
+
+  window.HavenThemeCompat?.cacheThemes?.(themes);
+  const published = themes.filter(t => t && t.published && _isFileThemeCompatible(t));
+
+  el.querySelectorAll('.theme-btn[data-custom-theme], .theme-bar-sep[data-custom-theme]').forEach(b => b.remove());
+
+  const seasonalThemes = published.filter(t => window.HavenThemeCompat?.isSeasonalTheme?.(t)), standardThemes = published.filter(t => !seasonalThemes.includes(t));
+
+  function addBtn(theme) {
+    const btn = document.createElement('button');
+    btn.className = 'theme-btn';
+    btn.dataset.theme = `file:${theme.file}`;
+    btn.dataset.customTheme = '1';
+    btn.title = theme.name || theme.file;
+    if (_isHavenSafeMode() || _isThemeRecoveryPending()) btn.disabled = true;
+    const icon = document.createElement('span');
+    icon.className = 'theme-icon';
+    icon.textContent = theme.icon || '🎨';
+    btn.appendChild(icon);
+    btn.addEventListener('click', () => {
+      const applied = applyPublishedThemeBase(theme.file, true, theme);
+      if (applied && typeof onPick === 'function') onPick(theme);
+    });
+    el.appendChild(btn);
+  }
+
+  for (const theme of standardThemes) {
+    addBtn(theme);
+  }
+
+  if (seasonalThemes.length > 0) {
+    if (el.classList.contains('auth-theme-bar')) {
+      const sep = document.createElement('span');
+      sep.className = 'theme-bar-sep';
+      sep.dataset.customTheme = '1';
+      sep.title = typeof t === 'function' ? t('app.theme.seasonal') : 'Seasonal';
+      sep.textContent = '•';
+      el.appendChild(sep);
+    }
+    for (const theme of seasonalThemes) {
+      addBtn(theme);
+    }
+  }
+
+  const saved = (() => { try { return localStorage.getItem('haven_theme') || ''; } catch { return ''; } })();
+  if (saved.startsWith('file:')) {
+    const file = saved.slice(5);
+    const selected = themes.find(theme => theme?.file === file);
+    const recoveryMode = _isHavenSafeMode() || _isThemeRecoveryPending();
+    const applied = selected && _isFileThemeCompatible(selected) && !recoveryMode
+      ? applyPublishedThemeBase(file, false, selected)
+      : null;
+    if (!applied && !recoveryMode) {
+      localStorage.setItem('haven_theme', 'haven');
+      document.documentElement.setAttribute('data-theme', 'haven');
+      document.querySelectorAll('link[id^="haven-theme-"]').forEach(link => link.remove());
+    }
+    el.querySelectorAll('.theme-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.theme === (applied ? saved : 'haven'));
+    });
+  }
 }

@@ -1,31 +1,36 @@
-# ⬡ Haven — User Guide
+# ⬡ Haven: User Guide
 
 Welcome to **Haven**, your private chat server. This guide covers everything you need to get Haven running and invite your friends.
 
+Prefer to watch? There are short [video tutorials](https://haven-app.com/tutorials.html) for the most common tasks, also on [YouTube](https://www.youtube.com/@Haven-App_Tutorials) and [Rumble](https://rumble.com/user/HavenApp).
+
 ---
 
-## 📋 What You Need
+## What You Need
 
 - **Windows 10 or 11** (macOS / Linux can run it manually)
-- **Node.js** version 18 or newer → [Download here](https://nodejs.org/)
-- About **50 MB** of disk space
-- **OR** just [Docker](https://docs.docker.com/get-docker/) — no Node.js needed
+- **Node.js** version 22 to 26 → [Download here](https://nodejs.org/)
+- About **200 MB** of disk space, plus whatever your community uploads
+- About **100 MB** of free memory for a small group. A Raspberry Pi is enough; measured numbers for every size are in [How much hardware does Haven need?](docs/hardware.md)
+- **OR** just [Docker](https://docs.docker.com/get-docker/), no Node.js needed
 
 ---
 
-## 🐳 Docker Setup (Alternative)
+## Docker Setup (Alternative)
 
 If you'd rather run Haven in a container (great for NAS boxes, servers, or if you just like Docker):
 
+Video: [Install with Docker](https://haven-app.com/tutorials.html#install-docker)
+
 ### Quick Start
 
-**Option A — Pre-built image** (fastest):
+**Option A: Pre-built image** (fastest):
 ```bash
 docker pull ghcr.io/ancsemi/haven:latest
 docker run -d -p 3000:3000 -v haven_data:/data ghcr.io/ancsemi/haven:latest
 ```
 
-**Option B — Build from source**:
+**Option B: Build from source**:
 ```bash
 git clone https://github.com/ancsemi/Haven.git
 cd Haven
@@ -43,7 +48,7 @@ That's it. Haven will be running at `https://localhost:3000`.
 
 ### Customizing
 
-Edit `docker-compose.yml` to change the port, server name, or other settings. The environment variables are commented out with examples — just uncomment what you need.
+Edit `docker-compose.yml` to change the port, server name, or other settings. The environment variables are commented out with examples. Just uncomment what you need.
 
 ### Using a Local Folder Instead of a Volume
 
@@ -56,22 +61,64 @@ volumes:
 
 Replace the `haven_data:/data` line in `docker-compose.yml`.
 
+### Podman (Fedora and similar)
+
+Haven runs under Podman as well. A few things differ from Docker:
+
+- **SELinux.** On Fedora, add `:Z` to a folder mount so the container may use it: `-v ./haven-data:/data:Z`.
+- **Ports below 1024.** Rootless Podman cannot listen on 443. Publish Haven's own port (`-p 3000:3000`) and, if you want people outside to reach it on 443, forward it in the firewall:
+  ```bash
+  sudo firewall-cmd --permanent --add-forward-port=port=443:proto=tcp:toport=3000
+  sudo firewall-cmd --reload
+  ```
+- **File owners.** Inside the container Haven runs as uid 1000, and the container hands the data folder to that user each time it starts. If you copy data in from another machine, or run Haven once outside the container against the same folder, and the container cannot fix the owner itself, it says so in the log. Fix it from the host with:
+  ```bash
+  podman unshare chown -R 1000:1000 ./haven-data
+  ```
+  If you start the container with `--userns=keep-id`, uid 1000 in the container is your own account (when your account is uid 1000), so use `sudo chown -R $(id -u):$(id -g) ./haven-data` instead.
+- **Updating.** The container runs the copy of Haven built into the image, not files on your machine, so extracting a new zip or running Haven outside the container does not update it (and running it outside against the data folder changes the file owners). Pull the new image and recreate the container; the data folder stays as it is:
+  ```bash
+  podman pull ghcr.io/ancsemi/haven:latest
+  podman rm -f haven
+  ```
+  Then run the same `podman run` command you started it with.
+
 ### Updating
 
-**Option A — Pre-built image** (default, recommended):
+**Option A: Pre-built image** (default, recommended):
 ```bash
 docker compose pull
 docker compose up -d --force-recreate
 ```
 
-**Option B — Built from source** (only if you uncommented `build: .`):
+**Option B: Built from source** (only if you uncommented `build: .`):
 ```bash
 git pull
 docker compose build --no-cache
 docker compose up -d
 ```
 
-Your data is safe — it lives in the volume, not the container.
+Your data is safe: it lives in the volume, not the container.
+
+### Early Access (Beta) Builds
+
+New features reach the `:beta` image a few days before `:latest`. To run them, change the image line in `docker-compose.yml` to:
+
+```yaml
+image: ghcr.io/ancsemi/haven:beta
+```
+
+then pull and recreate as above. With `docker run` or Podman, pull `ghcr.io/ancsemi/haven:beta` and start the container from that image instead. Your data stays as it is. To leave early access, set the line back to `:latest` once the next stable release is out, so you never move to an older version than the one you ran.
+
+### Updating Automatically
+
+The **Update Now** button in Settings can't update a Docker install: a container can't replace itself, and giving Haven control of Docker would give it control of the whole machine. To stay current without logging in, let the host do it on a schedule. On Linux (a Raspberry Pi included), run `crontab -e` and add a line like this one, with your own folder:
+
+```bash
+0 4 * * * cd /home/pi/haven && docker compose pull -q && docker compose up -d
+```
+
+That checks for a new image every night at 4:00 and restarts Haven only when there is one. It follows whichever image `docker-compose.yml` names, `:latest` or `:beta`.
 
 ### Checking Your Version
 
@@ -87,7 +134,7 @@ docker compose exec haven cat /app/package.json | grep '"version"'
 
 ### Linux Prerequisites
 
-If you're on Linux (Ubuntu, Mint, Debian, etc.), make sure you have Docker's official packages installed — the default `docker.io` package from some distros may be missing Compose V2.
+If you're on Linux (Ubuntu, Mint, Debian, etc.), make sure you have Docker's official packages installed. The default `docker.io` package from some distros may be missing Compose V2.
 
 **1. Install Docker Engine + Compose plugin:**
 
@@ -116,11 +163,19 @@ newgrp docker
 
 After that, `docker compose up -d` should work without errors.
 
+### Proxmox VE (LXC)
+
+If you run Proxmox VE in your homelab, an automated unprivileged LXC helper script is available. It supports automatic Caddy reverse proxy with Let's Encrypt SSL, Tailscale mesh VPN, or direct LAN modes.
+
+See the [Proxmox VE LXC Deployment Guide](docs/examples/proxmox-lxc/README.md) for quick-start instructions and configuration flags.
+
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
-### Step 1 — First Launch
+### Step 1: First Launch
+
+Videos: [Install on Windows](https://haven-app.com/tutorials.html#install-windows) · [Install on Linux](https://haven-app.com/tutorials.html#install-linux) · [First login](https://haven-app.com/tutorials.html#first-login)
 
 Double-click **`Start Haven.bat`**
 
@@ -131,20 +186,20 @@ That's it. The batch file will:
 4. Start the server
 5. Open your browser to the login page
 
-### Step 2 — Create Your Admin Account
+### Step 2: Create Your Admin Account
 
 1. On the login page, click **Register**
-2. Create an account with the admin username (default: `admin` — check your data directory's `.env` file)
+2. Create an account with the admin username (default: `admin`; check your data directory's `.env` file)
 3. This account can create and delete channels
 
-### Step 3 — Create a Channel
+### Step 3: Create a Channel
 
 1. In the sidebar, use the **Create Channel** box (admin only)
 2. Give it a name like "General" or "Gaming"
 3. Haven generates a unique **channel code** (8 characters)
-4. Share this code with your friends — it's the only way in
+4. Share this code with your friends: it's the only way in
 
-### Step 4 — Invite Friends
+### Step 4: Invite Friends
 
 Send your friends:
 1. Your server address: `https://YOUR_IP:3000`
@@ -154,11 +209,15 @@ They'll register their own account, then enter the code to join your channel.
 
 ---
 
-## 📂 Channels & Sub-Channels
+## Channels & Sub-Channels
 
 ### How Channels Work
 
-Every conversation in Haven happens inside a **channel**. Channels are like rooms — each has a unique 8-character code (e.g. `a3f8b2c1`). To get into a channel, you either create it or enter its code.
+Every conversation in Haven happens inside a **channel**. Channels are like rooms: each has a unique 8-character code (e.g. `a3f8b2c1`). To get into a channel, you either create it or enter its code.
+
+### Forum Channels 🗂️
+
+Turn any channel into a forum from **Channel Functions → Forum**, or tick **Forum** when creating it. In a forum channel every message is a topic, and the feed runs newest first: the most recently active topic sits at the top. Replies go in that message's thread, the topic shows its reply count, and a new reply moves the topic back to the top, so old topics resurface instead of sinking. Inside a topic's thread, replies read top to bottom as usual. Every topic carries a **Reply to this topic** button, and the Reply action on a topic opens its thread rather than quoting it as a new topic. Everything else works as usual: topics can be pinned, reacted to, searched, and moved between channels with Move Messages.
 
 ### Creating Sub-Channels
 
@@ -184,48 +243,51 @@ When creating a sub-channel, check the **🔒 Private** checkbox. Private sub-ch
 
 Use private sub-channels for admin-only discussions, sensitive topics, or small breakout groups within a larger channel.
 
+Any channel can be switched between private and public later from **Channel Functions → Private**. Going private keeps everyone who is already a member. Going public opens the channel to the whole server, history included.
+
 ---
 
-## � Importing from Discord
+## Importing from Discord
 
-Haven can import your entire Discord server's message history — directly from the app. No external tools required.
+Haven can copy a Discord server's message history into Haven channels. The easiest way uses your Ferry bot: nothing to download, nothing to paste.
 
-### Method 1: Direct Connect (Recommended)
+### Method 1: Your Ferry bot (recommended)
 
-1. Open **Settings** (⚙️ in the sidebar) → scroll to **Import Discord History**
-2. Click the **🔗 Connect to Discord** tab
-3. Get your Discord token:
-   - Open Discord in your browser (or desktop app with dev tools enabled)
-   - Press **F12** → go to the **Application** tab
-   - In the left sidebar: **Local Storage** → **https://discord.com**
-   - Find the key called **`token`** and copy its value (without quotes)
-4. Paste the token and click **Connect**
-5. Pick a server from the grid, then select which channels and threads to import
-6. Click **Fetch Messages** — Haven downloads everything
-7. In the preview, rename channels if you want, then click **Import**
+1. Set up Ferry if you haven't yet. The [Ferry section](#ferry-discord-bridge) walks you through it and takes about two minutes. For importing you only need its first two parts: create the bot, then connect it to Haven and add it to your Discord server. You don't have to turn Ferry on or pair any channels.
+2. In Haven, open **Settings** (⚙️ in the sidebar) → **Import Discord History**, then click the **🔗 Connect to Discord** tab
+3. Click **Use my Ferry bot**
+4. Pick your Discord server, then tick the channels and threads you want
+5. Click **Fetch Messages** and wait while Haven copies them. A big server can take a few minutes
+6. In the preview, rename channels if you want, then click **Import Selected**
 
-**What gets imported:** messages, replies, embeds, attachments, reactions, pins, forum tags, and original Discord avatars.
+Discord keeps private channels hidden from the bot until its role is added to them. Haven greys those channels out with a 🔒 so you can see which ones they are. To bring one in, add the bot's role to that channel in Discord with **View Channel** and **Read Message History** ([here's how](#2-connect-it-to-haven)), then pick your server again. If a channel still can't be read, Haven skips it and tells you which ones it skipped.
 
-**Channel types supported:** text, announcement, forum, media, plus active and archived threads.
+Don't give the bot **Administrator** to get around this. Anyone who got hold of its token would then control your whole Discord server.
 
-### Method 2: File Upload
+**What gets imported:** messages, replies, embeds, reactions, pins, links to attachments, and the original Discord names and avatars.
 
-If you prefer, export your Discord data with [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter) (JSON format), then:
+**Channel types supported:** text, announcement, forum, media, plus active and archived public threads.
 
-1. Open **Settings** → **Import Discord History**
-2. Click the **📁 Upload File** tab
-3. Drag/drop or browse for the `.json` or `.zip` file
-4. Preview, rename channels, and import
+### Method 2: Upload an export file
+
+If you'd rather not set up a bot, Discord can give you a download of your own messages (only yours, not everyone's):
+
+1. In Discord, go to **User Settings → Data & Privacy → Request all of my Data**. Discord emails you a ZIP when it's ready, which can take a few days
+2. In Haven, open **Settings** → **Import Discord History**. The **📁 Upload File** tab is already open
+3. Drop the ZIP in, or click **browse** to find it
+4. In the preview, rename channels if you want, then click **Import Selected**
+
+Export files from DiscordChatExporter (JSON) work here too.
 
 ### Important Notes
 
 - Imported messages appear as the original Discord usernames, but they're all stored under the admin account. They're clearly marked as imported from Discord.
-- The import is **history only** — Discord roles, permissions, bots, and webhooks are not imported.
-- Your Discord token is never stored by Haven. It's used only during the import session and discarded.
+- The import is **history only**: Discord roles, permissions, bots, and webhooks are not imported.
+- To keep chatting with people who stay on Discord, use [Ferry](#ferry-discord-bridge) to bridge channels between the two.
 
 ---
 
-## �🔑 Join Code Settings (Admin)
+## Join Code Settings (Admin)
 
 Each channel's invite code can be configured by admins. Click the **⚙️ gear icon** next to the channel code in the header.
 
@@ -253,7 +315,21 @@ You can also click **Rotate Now** to manually change the code immediately.
 
 ---
 
-## 🖼️ Avatars
+## Location Data in Photos and Videos
+
+Phones save where a photo or video was taken inside the file itself. Haven removes that when someone uploads to a channel, so nobody can work out where it was taken.
+
+- **Every server:** JPEG, PNG and WebP photos are cleaned. There's nothing to install.
+- **With exiftool and ffmpeg installed:** videos and every other photo format (HEIC, RAW and so on) are cleaned too. The Docker image already has both.
+  - Linux: `sudo apt install ffmpeg libimage-exiftool-perl` (or your distro's equivalent), then restart Haven.
+  - Windows: `winget install Gyan.FFmpeg`, and download exiftool from [exiftool.org](https://exiftool.org). Rename `exiftool(-k).exe` to `exiftool.exe` and either put it on your PATH or set `HAVEN_EXIFTOOL_PATH` to it, then restart Haven.
+- **What it can't reach:** files in encrypted DMs (they're encrypted before the server ever sees them), copies people already downloaded, files Ferry already sent to Discord, and your backups.
+
+The first start after updating also goes through files uploaded before this existed. With the tools installed, a file that can't be cleaned is held back instead of shown, and its message says so. The server log says at startup which of the two modes it's in.
+
+---
+
+## Avatars
 
 ### Uploading a Profile Picture
 
@@ -271,11 +347,31 @@ Click **Clear** to remove your avatar and revert to the default initial-letter a
 
 ---
 
-## 🎨 Themes & Effects
+## Themes & Effects
 
 ### Themes
 
-Haven includes 20+ visual themes. Click the **🎨** button at the bottom of the sidebar to open the theme picker. Themes change colors, fonts, and overall aesthetic. Your choice is saved per browser.
+Haven includes 20+ visual themes. Click the **🎨** button at the bottom of the sidebar to open the theme picker. Every theme has a small preview card in its own colors; type in the search box to find one by name, author or description, and fold away a section you do not need. Community themes the admin has published come first, then Seasonal ones, then Haven's own. Themes change colors, fonts, and overall aesthetic. Your choice is saved to your account.
+
+| Button | Theme | Style |
+|--------|-------|-------|
+| ⬡ | **Haven** | Deep blue/purple (default) |
+| 🎮 | **Discord** | Dark gray with blue accents |
+| Ⅿ | **Matrix** | Black and green, scanline overlay |
+| ◈ | **Tron** | Black with neon cyan glow |
+| ⌁ | **HALO** | Military green with Mjolnir vibes |
+| ⚜ | **LoTR** | Parchment gold and deep brown |
+| 🌆 | **Cyberpunk** | Neon pink and electric yellow |
+| ❄ | **Nord** | Arctic blue and frost |
+| 🧛 | **Dracula** | Deep purple and blood red |
+| ⚔ | **Bloodborne** | Gothic crimson and ash |
+| ⬚ | **Ice** | Pale blue and white |
+| 🌊 | **Abyss** | Deep ocean darkness |
+
+Servers also include the optional **Compact** Theme API v1 file theme. An admin
+can publish it from **Settings → Admin → Branding → Custom Themes**. Compact
+tightens the desktop chrome while preserving the user's separate message-density
+choice under **Settings → Layout**.
 
 ### Effect Overlays
 
@@ -301,7 +397,7 @@ Effects are stackable visual layers on top of any theme. Choose from the effect 
 
 ### Cyberpunk Text Scramble ⚡
 
-When the Glitch effect is active, text around the UI randomly "scrambles" — cycling through random characters before resolving back to the original text. This affects:
+When the Glitch effect is active, text around the UI randomly "scrambles", cycling through random characters before resolving back to the original text. This affects:
 - The **HAVEN** logo
 - Channel names in the sidebar
 - Section labels
@@ -309,23 +405,148 @@ When the Glitch effect is active, text around the UI randomly "scrambles" — cy
 - The channel header
 - User names in the member list
 
-A **Glitch Frequency** slider appears in the theme popup when this effect is active. Slide left for rare, subtle glitches — or right for constant chaos.
+A **Glitch Frequency** slider appears in the theme popup when this effect is active. Slide left for rare, subtle glitches, or right for constant chaos.
+
+### Bundled optional themes and plugins
+
+Haven also ships optional extras that are **installed but switched off by default**, so you will not see them until an admin turns them on. They are already on your server, including in the Docker image. There is nothing to download.
+
+| File | What it is |
+|------|-----------|
+| `themes/compact.theme.css` | Compact, a dense graphite Theme API v1 theme |
+| `themes/braid.theme.css` | Braid, a dark mint theme |
+| `themes/braid-light.theme.css` | Braid Light |
+| `themes/amni-scient.theme.css` | Amni-Scient, gold on ink with the Archivo typeface |
+| `themes/amni-scient-light.theme.css` | Amni-Scient Light |
+| `themes/glassy-neon.theme.css` | Glassy Neon, Haven on the Grid: holo-glass panels with lit edge rails, light-cycle trails, circuit traces, a racing perspective light floor and a spinning identity disc |
+| `themes/christmas.theme.css` | Christmas, a cozy cabin with a crackling fireplace, a twinkling tree and presents, string lights, frosted window edges and three layers of falling snow |
+| `themes/halloween.theme.css` | Halloween, a cartoony haunted night with bats over the moon, a floating ghost, flickering jack-o'-lanterns, a black cat, a bubbling cauldron, fog and dripping goo |
+| `themes/thanksgiving.theme.css` | Thanksgiving, a harvest evening with tumbling leaves, swaying trees, wobbling turkeys, hay bales, corn and pumpkins |
+| `plugins/CompactLayout.plugin.js` | Reversible desktop layout that pairs with Compact or any other theme |
+| `plugins/ChromeLayout.plugin.js` | Condensed sidebar with docked DMs, prominent + action, and channel voice controls |
+| `plugins/BraidLayout.plugin.js` | Braid's layout changes |
+| `plugins/ChannelTabsLayout.plugin.js` | Channels and DMs tabs above the sidebar list, with a Join or create button |
+| `plugins/MessageTimestamps.plugin.js` | Adds timestamps to messages |
+| `plugins/HavenGlyphs.plugin.js` | Reversible contextual interface icons using the bundled local Font Awesome font |
+| `public/fonts/fa-solid-900.woff2` | Local Font Awesome Solid font used by Haven Glyphs |
+
+To make a bundled theme available to everyone, publish it. The quickest way is the theme picker itself: admins (and anyone with Manage Server) see an **Available to publish** section there with every theme nobody has published yet, and each theme file's card has a **Publish** switch. **Settings → Admin → 🏠 Branding → Custom Themes** does the same. Until a theme is published, members do not see it in their picker or in **Settings → Plugins & Themes** and cannot switch to it, even though the file is present, which is the usual reason a theme "looks missing" after an update. Someone who was already using a theme when it was unpublished keeps it until they pick another.
+
+Custom themes work the same way. Drop a `<name>.theme.css` file into the `themes/` folder, restart, then publish it in the same place. A theme can also be set as the server **default** from that section, which applies to anyone who has not already picked a theme of their own. It is a default rather than a lock, so a user who chooses a different theme keeps their choice.
+
+Administrators can check supported plugins and themes for updates under
+**Settings → Admin → Extension Updates**. Extension authors can add update support using
+the metadata and GitHub release format in the
+[extension update and maintainer guide](docs/extension-updates.md).
+
+Enable **Compact Layout** per browser under **Settings → Plugins & Themes**. It
+folds the server rail into the navigation sidebar and docks account and active
+voice controls in that sidebar's footer on desktop. Tablet and mobile keep the
+native Haven layout. Use its `C` footer button or `Ctrl+Alt+C` to switch between
+Compact and classic layout without disabling the plugin.
+Only one structural layout plugin can be active at a time. If Braid Layout is
+already engaged, Compact waits until Braid restores the native layout, and vice
+versa. The **Sidebar Layout** picker in **Settings → Layout** switches between them: **Original**
+(Haven's own layout), then every layout plugin on the server. A new layout
+plugin appears there by itself; see [Appearing in the Layout picker](docs/theme-authoring.md#appearing-in-the-layout-picker).
+
+Haven Glyphs is optional per browser under **Settings → Plugins & Themes**. It
+uses the bundled local Font Awesome font for interface affordances. Message
+bodies, reactions, emoji/GIF pickers, soundboard names, user content, and form
+fields stay unchanged. It can be disabled from the same settings screen.
+
+Theme authors who need stable CSS variables and semantic layout selectors should use the [Theme API v1 authoring reference](docs/theme-authoring.md) instead of depending on Haven's internal classes and IDs.
+
+If a theme or plugin makes the interface unusable, open `/app.html?haven-safe-mode=1`. Haven will suppress file themes and avoid fetching or evaluating plugins for that tab, allowing the extension choices to be reset from **Settings → Plugins & Themes**.
+
+### Background images (wallpapers)
+
+A theme is ordinary CSS, so it can set a background image and not just colours.
+Put the image in `themes/` next to your `.theme.css` file, then point at it with
+a plain relative path. Haven serves the whole `themes/` folder, so
+`url("wallpaper.jpg")` resolves to `/themes/wallpaper.jpg` on its own.
+
+```css
+.main {
+  background-image:
+    linear-gradient(rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0.55)),
+    url("wallpaper.jpg");
+  background-size: cover;
+  background-position: center;
+}
+```
+
+`.main` is the chat area. The message list, the channel header and the messages
+themselves have no background of their own, so the image shows through behind
+all of them.
+
+The `linear-gradient` on top is a dark scrim, and it is doing real work: over a
+bright or busy photo, message text becomes unreadable without it. Raise `0.55`
+towards `1` to dim the image further, lower it to let more through, or delete
+that line entirely if your image is already dark. On a light theme, use white
+(`rgba(255, 255, 255, 0.6)`) instead.
+
+The sidebar keeps its own colour and is not covered. Add `.sidebar` to the same
+rule if you want the image there too, or set it on `body` to cover everything.
+
+Two things worth knowing before you plan around this:
+
+- A theme is a file on the server, so **adding one needs access to the server
+  itself**, and publishing it puts it in the theme picker for everyone. There is
+  no per-user wallpaper setting. It is personal only in the sense that a theme
+  applies to whoever picks it.
+- Keep the file reasonably small. Every member downloads it when they select the
+  theme, and a 12 MB photo is a 12 MB download.
+
+> **Docker users:** `themes/` and `plugins/` live inside the image, not in the `/data` volume, so pulling a newer image is all you need to get new bundled files. Remember to recreate the container afterwards (`docker compose up -d`), since pulling alone leaves the old container running the old image. If you bind-mount over `/app`, your host folder wins and you will need to add the files there yourself.
 
 ---
 
-## 🌐 Setting Up Remote Access (Friends Over the Internet)
+## Setting Up Remote Access (Friends Over the Internet)
 
-If your friends are **not** on your local WiFi, you need to set up port forwarding so they can reach your PC from the internet.
+If your friends are **not** on your local WiFi, you need a way for them to reach
+your machine. There are three routes here, least safe first:
+
+1. **Port forwarding** (this section): simplest, but it puts your Haven login page
+   in front of the whole internet.
+2. **[Tailscale / WireGuard](#tailscale--wireguard-no-port-forwarding-no-exposed-ip)**:
+   the safest. Nothing is exposed publicly and you never touch your router.
+3. **[Cloudflare Tunnel](#cloudflare-tunnel-no-port-forwarding)**: a public URL
+   without opening a port or revealing your home IP.
+
+Haven can also run LocalTunnel or Cloudflared for you from **Settings, Admin,
+Tunnel** if you would rather not install anything by hand.
+
+### Before you port forward, know what it costs
+
+Opening a port means anybody on the internet can reach your Haven login page. Some
+of that is not obvious up front:
+
+- **Bot networks.** Automated scanners sweep the whole internet looking for
+  misconfigured services. Within minutes of forwarding a port, your address starts
+  getting probed. Almost all of it bounces off Haven and your firewall, but the risk
+  is not zero, and it uses a little of your bandwidth around the clock.
+- **DHCP drift.** Most home routers hand out addresses dynamically, so the machine
+  running Haven can land on a different local IP after a reboot. Your port forward
+  then points at whatever device took the old address, which means your friends
+  cannot reach Haven and something else on your network is exposed instead. Assign
+  the Haven machine a static IP to prevent this, see the DHCP reservation step below.
+- **Password guessing.** Haven rate-limits sign-in attempts (20 per 15 minutes per
+  IP address) and supports two-factor authentication, so it is not defenceless. But
+  a login page on the open internet will be tried, so use a password you have not
+  used anywhere else and turn on MFA.
+
+If that is acceptable to you, carry on. If not, use Tailscale or a tunnel instead.
 
 ### Find Your Public IP
 
-Visit [whatismyip.com](https://whatismyip.com) — the number shown (like `203.0.113.50`) is what your friends will use.
+Visit [whatismyip.com](https://whatismyip.com). The number shown (like `203.0.113.50`) is what your friends will use.
 
 ### Port Forwarding on Your Router
 
 Every router is different, but the general steps are:
 
-1. **Log into your router** — usually `http://192.168.1.1` or `http://10.0.0.1` in your browser
+1. **Log into your router**: usually `http://192.168.1.1` or `http://10.0.0.1` in your browser
 2. Find **Port Forwarding** (sometimes called NAT, Virtual Servers, or Applications)
 3. Create a new rule:
 
@@ -364,13 +585,102 @@ https://YOUR_PUBLIC_IP:3000
 
 > ⚠️ **Certificate Warning:** Your friends' browsers will show a security warning because Haven uses a self-signed certificate. This is normal and expected. Tell them to click **"Advanced"** → **"Proceed to site"**. The connection is still encrypted.
 
+> **No OpenSSL? No problem.** If there is no certificate when Haven starts, it makes one itself, so HTTPS works on a clean Windows install. To run plain HTTP on purpose (behind a reverse proxy that handles TLS, or LAN only), set `FORCE_HTTP=true` in your `.env`. Voice, camera and the mobile app need HTTPS on any address other than localhost.
+
 ---
 
-## � Cloudflare Tunnel (No Port Forwarding)
+## Tailscale / WireGuard (No Port Forwarding, No Exposed IP)
 
-If you don't want to mess with port forwarding or expose your home IP, you can use a **Cloudflare Tunnel** to securely share your Haven server over the internet. Cloudflare gives your server a public URL and handles all the networking — no router config needed.
+Port forwarding above opens your Haven login page to the entire internet.
+Tailscale does not: it builds an encrypted tunnel straight between your
+machine and your friend's, so nothing is exposed publicly and you never touch
+your router or firewall. It is the safest of the three methods here.
 
-### Step 1 — Install Cloudflared
+> #### Voice chat over a *shared device*
+> Text chat, uploads, and everything that flows **through** the Haven server work
+> perfectly with the shared-device setup below. **Voice is the exception.** Haven
+> voice is peer-to-peer: everyone in a call opens a direct connection to every
+> *other* person in the call, not just to the host. Sharing a single device only
+> puts the **host** machine on the shared path, so your friends can reach the host
+> but not each other, and the return path from the host back to a friend isn't
+> guaranteed either. The classic symptom is **one-directional audio**: everyone
+> hears the host, but the host can't hear anyone. This isn't a bug in the
+> shared-device config, it's that a single shared machine can't provide the full
+> mesh of paths a peer-to-peer call needs.
+>
+> Two ways to get voice working, most recommended first:
+> 1. **Add a TURN server** under **Settings, Admin, Voice & Connectivity
+>    (STUN/TURN)**. TURN relays all voice media through one reachable point, so the
+>    peer-to-peer paths are no longer required and the secure single-device sharing
+>    below keeps working exactly as written. You can run your own
+>    [coturn](https://github.com/coturn/coturn) or use a hosted TURN provider.
+> 2. **Put everyone on the same tailnet** instead of sharing one device. Tailnet
+>    members get direct connectivity to one another, so the mesh forms and voice
+>    works both ways. This works, but it gives your friends **broader access than
+>    device-sharing does**, so read **Step 4** below and only do this if you accept
+>    that tradeoff.
+
+- Unlike port forwarding, Tailscale does not require you to touch your router or your computer's firewall. Tailscale uses [Wireguard](https://en.wikipedia.org/wiki/WireGuard) under the hood, which is the same protocol many reputable VPN companies use. Wireguard creates an encrypted, end-to-end tunnel from your computer to your friend's computer. Most firewalls, like the one your router and computer use, allow outbound connections by default. Tailscale establishes a persistent, outbound connection to the Tailscale coordination server, which then allows your friends to connect. This is why configuring your firewall is not a requirement for this method. 
+  
+- Anyone who wants access to your Haven server will first need a **Share link** generated by you, the administrator, via your Tailscale admin dashboard. If you follow this guide correctly, your friend will **only** have access to Haven and strictly nothing else on your device.
+- The obvious tradeoff with this approach is setup. Both you and your friends will need to connect to Tailscale anytime you want to access Haven. But the bright side of this approach is once setup is complete, and you're logged in, connecting to Tailscale is as simple as flipping a switch. Tailscale works on pretty much all devices you can think of, and it's seamless.
+- To be clear, Tailscale does change your device's DNS settings. But unlike a traditional VPN, Tailscale **does not** route your internet traffic through some remote server. Tailscale is **purely** a connection between your computer, and your friend's computer. Your IP does not change and your internet speed doesn't slow down in any meaningful way.
+
+### Step 1 - Make an account
+- Visit https://tailscale.com and make an account. Tailscale will walk you through downloading Tailscale onto your device, you may proceed with that.
+
+- Once Tailscale is running on your machine, it may ask you to add another device, click the "Skip" button at the bottom of the page.
+
+ 
+### Step 2: Navigate to Tailscale admin page
+Click [here](https://console.tailscale.com/admin/machines) to access the admin page. Here, you will see a list of all the devices on your Tailnet. 
+
+### Step 3: Lock down access
+- Currently, if you share access to your Tailscale device, any other ports that are open on your machine will be reachable by your friends. We solve this issue by setting up ACL rules. ACL Rules will ensure only Haven is accessible by your friends, and strictly nothing else.
+- On your Tailscale admin page, click "Access Controls".
+- Click "JSON Editor" and replace everything in that section with the following, secure config:
+   - Please ensure you copy everything, including the trailing comma at the end of the code block 
+  ```
+  {
+  "grants": [
+    // autogroup:member are members of your tailnet. We are sharing a device with your friends, NOT adding them to our tailnet. So you are the only person on your tailnet who should have this permission. And therefore, we are giving members of this tailnet unrestricted access to everything.
+    {
+      "src": ["autogroup:member"],
+      "dst": ["*"],
+      "ip":  ["*"],
+    },
+
+    // autogroup:shared are your friends who are connecting to your shared machine. This control restricts the port your friends may use to connect to your machine. If you changed your Haven port, make sure to change the ports to whatever port you set. Otherwise, leave everything below as default. 
+    {
+      "src": ["autogroup:shared"],
+      "dst": ["*"],
+      "ip":  ["3000", "3001"],
+    },
+  ],
+   }
+  ```
+
+### Step 4: Share, not invite
+- This step is critical. There is a fundamental difference between inviting someone to your tailnet, and simply sharing one machine. The settings above DO NOT apply if you invite someone to your tailnet, and they will get access to your **whole tailnet**. If your Haven computer is running any other web server, or if you add more Tailscale devices down the road, your friends will have access to them. You do not want this. 
+- To **SHARE** a device, go to your Tailscale admin page, click the 3 dot menu next to your device, and click **Share**. If you are sharing a link, make sure **Reusable link** is turned off. This way, each link you use only works once, and you maintain complete control over who can access your shared device.
+
+### Step 5: Sharing the link
+- Once you provide a share link to your friend, he will need to make an account on Tailscale, download the client and connect on his machine. Please note, your friend **does not** need to share anything from his end. Only the person hosting Haven will have to share.
+- Once your friend accepts the link, his device will now be able to reach your shared device.
+- Sharing is one way. Your friend's device will not appear in your admin page, and it does not need to. If he can see your machine on his end, the share worked.
+
+### Step 6: Usage
+- Once everything is wired up, go to your Tailscale admin page, find your device, and notice the **IP Address** listed next to your device. This is your Tailnet IP address. It is not your actual IP address.
+- Accessing Haven is as simple as going to https://TailscaleIPAddress:3000 (or whatever port you configured in ACL settings)
+- Please note: If you are the one hosting Haven, you may also access Haven from your LAN IP that Haven is running on (typically 192.168.X.X), but your friends **need** to use your Tailscale IP.
+
+---
+
+## Cloudflare Tunnel (No Port Forwarding)
+
+If you don't want to mess with port forwarding or expose your home IP, you can use a **Cloudflare Tunnel** to securely share your Haven server over the internet. Cloudflare gives your server a public URL and handles all the networking: no router config needed.
+
+### Step 1: Install Cloudflared
 
 **Windows (via winget):**
 ```powershell
@@ -393,24 +703,24 @@ Verify it installed:
 cloudflared --version
 ```
 
-### Step 2 — Enable the Tunnel in Haven
+### Step 2: Enable the Tunnel in Haven
 
 1. Start Haven normally (`Start Haven.bat`)
 2. Log in as admin
-3. Open **⚙️ Settings** → scroll to the **Tunnel** section
-4. Select **Cloudflare** as the tunnel provider
-5. Flip the toggle **on**
+3. Open **⚙️ Settings** → **Admin** → **Tunnel**
+4. Pick **Cloudflared** in the Provider list
+5. Click **Start Tunnel**
 6. Haven will start cloudflared and display your public URL (e.g. `https://abc-def-123.trycloudflare.com`)
 
-### Step 3 — Share the URL
+### Step 3: Share the URL
 
-Copy the tunnel URL and send it to your friends. That's it — no port forwarding, no firewall rules, no IP address sharing. The URL changes each time you restart the tunnel, so you'll need to re-share it.
+Copy the tunnel URL and send it to your friends. That's it: no port forwarding, no firewall rules, no IP address sharing. The URL changes each time you restart the tunnel, so you'll need to re-share it.
 
 ### How It Works
 
 - Haven runs **cloudflared** as a child process that creates an encrypted tunnel to Cloudflare's network
 - Cloudflare assigns a random public URL and proxies traffic through the tunnel to your local server
-- Your home IP is **never exposed** to visitors — they only see Cloudflare's IP
+- Your home IP is **never exposed** to visitors; they only see Cloudflare's IP
 - Since Haven runs HTTPS with a self-signed cert, the tunnel connects to `https://localhost:3000` with TLS verification disabled (the Cloudflare→You leg is already encrypted by the tunnel itself)
 
 ### Tunnel vs. Port Forwarding
@@ -437,7 +747,7 @@ Copy the tunnel URL and send it to your friends. That's it — no port forwardin
 
 ---
 
-## 🔁 Reverse Proxy (Caddy, nginx, Traefik)
+## Reverse Proxy (Caddy, nginx, Traefik)
 
 If you already have a domain and want Haven to live behind a proper reverse proxy (so you get a real Let's Encrypt cert, no browser warnings, and the same `https://chat.example.com` URL every time), set `FORCE_HTTP=true` and let the proxy terminate TLS for you.
 
@@ -513,7 +823,75 @@ The `Upgrade` / `Connection` headers are required for Socket.io WebSocket traffi
 
 ---
 
-## 🔧 Router-Specific Tips
+## Outgoing Proxy
+
+If the server can only reach the internet through a proxy (for example a Docker container with no route out and a filtering proxy beside it), set the standard proxy variables in `.env`:
+
+```env
+https_proxy=http://proxy.example:3128
+http_proxy=http://proxy.example:3128
+no_proxy=localhost,127.0.0.1
+```
+
+Link previews, the media proxy, bot callbacks, push notifications and Haven's other outgoing requests then go through the proxy. Hosts listed in `no_proxy` (names, subdomains, IP addresses or CIDR ranges) connect directly. Only `http://` proxy addresses are supported. Voice traffic is UDP and does not use the proxy.
+
+For a link a member posts (link previews, the media proxy, bot callbacks, push), Haven looks the name up itself, refuses private, loopback and cloud metadata addresses, and then sends the proxy to the address it checked: a `CONNECT` to that IP for `https://` sites, and the IP in the request line (with the site's name in the `Host` header) for `http://` sites. The proxy never has to look the name up again, so it can't be steered to a different address.
+
+A name the server can't resolve on its own is refused. If your server has no DNS of its own and only the proxy can resolve names, set:
+
+```env
+OUTBOUND_PROXY_RESOLVES_NAMES=true
+```
+
+> ⚠️ **With that setting, your proxy becomes part of Haven's security.** Names Haven can't resolve are then passed to the proxy unchecked, and the proxy decides where they go. A proxy that can reach your internal network could let members use link previews to reach hosts behind it. Restrict the proxy to the destinations Haven needs, ideally with whole-hostname allowlist rules.
+
+---
+
+## External Media Storage (S3)
+
+By default, attachments, avatars, borders, emoji, stickers, sounds, badge icons, role icons and the server icon and banner live in the `uploads` folder of Haven's data folder. You can keep them in an S3-compatible bucket instead: Garage, MinIO, RustFS, SeaweedFS or AWS S3. The database, certificates and `.env` stay in the data folder either way.
+
+```env
+HAVEN_EXTERNAL_STORAGE=true
+HAVEN_S3_ENDPOINT=http://garage:3900
+HAVEN_S3_BUCKET=haven-media
+HAVEN_S3_REGION=garage            # AWS: your region, such as us-east-1
+HAVEN_S3_ACCESS_KEY=...
+HAVEN_S3_SECRET_KEY=...
+# HAVEN_S3_PREFIX=haven/          # optional: keep Haven's files under a prefix
+# HAVEN_S3_FORCE_PATH_STYLE=true  # the default; Garage, MinIO and RustFS need it
+```
+
+- **It's an add-on, downloaded only if you turn it on.** Haven talks to the bucket through Amazon's S3 library, which isn't part of a normal install or the Docker image. The first start with `HAVEN_EXTERNAL_STORAGE=true` installs it into the data folder (`addons/s3`, about 16 MB, at versions pinned by Haven), so that start needs to reach registry.npmjs.org once. A bucket on your own NAS still needs no outside service after that.
+- **The bucket stays private.** Haven reads each file and serves it itself, with the same safety headers as files on disk, so don't make the bucket public.
+- **Haven won't start without it.** If the bucket can't be reached or the key is wrong, Haven stops at startup and names the endpoint, the bucket and the reason. It doesn't fall back to the disk.
+- **Location data is still removed first.** Uploads are cleaned on the server before they reach the bucket, and photos already in the bucket are checked once.
+
+### Moving an existing server to a bucket
+
+1. Set the variables above, plus `HAVEN_S3_LOCAL_FALLBACK=true`, and restart. Files still on disk keep being served while you move them.
+2. Copy them over. It's safe to run again, and nothing on disk is removed yet:
+   ```bash
+   node scripts/migrate-uploads-to-s3.js
+   # Docker: docker compose exec haven node scripts/migrate-uploads-to-s3.js
+   ```
+3. Remove `HAVEN_S3_LOCAL_FALLBACK` and restart. Everything should still load.
+4. Free the disk space. This only removes local files once the bucket holds all of them:
+   ```bash
+   node scripts/migrate-uploads-to-s3.js --delete-local
+   ```
+
+If the server finds files on disk that aren't being served, it says so at startup.
+
+### Backups
+
+The bucket is the backup of the files themselves; use your storage's own replication or snapshots for it. Haven's backups still include the files when you choose **files**, copied out of the bucket one at a time, which takes a while on a large server. With scheduled backups, every run copies the whole bucket. Restoring a backup puts its files back into the bucket on the next start.
+
+If files are added to or removed from the bucket outside Haven, rebuild Haven's list of them with `node scripts/reconcile-media.js`.
+
+---
+
+## Router-Specific Tips
 
 ### Xfinity / Comcast (XB7 Gateway)
 
@@ -521,46 +899,23 @@ The `Upgrade` / `Connection` headers are required for Socket.io WebSocket traffi
 2. Go to **WiFi** → scroll down → **Advanced settings** → **Port forwarding**
 3. Select your PC from the device list
 4. Add port `3000` (TCP/UDP) and apply
-5. **Important:** Go to **Home** → disable **xFi Advanced Security** — it silently blocks all inbound connections
+5. **Important:** Go to **Home** → disable **xFi Advanced Security** (it silently blocks all inbound connections)
 6. Verify the **reserved IP** in port forwarding matches your PC's actual IP (`ipconfig` to check)
 
 ### Common Issues
 
 | Problem | Solution |
 |---------|----------|
-| **"SSL_ERROR_RX_RECORD_TOO_LONG"** | Browser is using `https://` but server is running HTTP. Change URL to `http://localhost:3000`, or install OpenSSL and restart (see Troubleshooting below) |
+| **"SSL_ERROR_RX_RECORD_TOO_LONG"** | Browser is using `https://` but server is running HTTP. Change URL to `http://localhost:3000`, or unset `FORCE_HTTP` and restart (see Troubleshooting below) |
 | Friends get "took too long to respond" | Port forwarding not set up, or firewall blocking |
-| Friends get "connection refused" | Server isn't running — launch `Start Haven.bat` |
+| Friends get "connection refused" | Server isn't running: launch `Start Haven.bat` |
 | Can't connect with `https://` | Make sure you're using port 3000, not 443 |
-| Voice chat doesn't work | Must use `https://` — voice requires a secure connection |
-| "Certificate error" in browser | Normal — click Advanced → Proceed |
+| Voice chat doesn't work | Use `https://` (or `http://localhost` on the server itself). Browsers only allow the microphone on a secure connection |
+| "Certificate error" in browser | Normal. Click Advanced → Proceed |
 
 ---
 
-## 🎨 Themes
-
-Haven comes with 6 themes. Switch between them using the theme buttons at the bottom of the left sidebar:
-
-| Button | Theme | Style |
-|--------|-------|-------|
-| ⬡ | **Haven** | Deep blue/purple (default) |
-| 🎮 | **Discord** | Dark gray with blue accents |
-| Ⅿ | **Matrix** | Black and green, scanline overlay |
-| ◈ | **Tron** | Black with neon cyan glow |
-| ⌁ | **HALO** | Military green with Mjolnir vibes |
-| ⚜ | **LoTR** | Parchment gold and deep brown |
-| 🌆 | **Cyberpunk** | Neon pink and electric yellow |
-| ❄ | **Nord** | Arctic blue and frost |
-| 🧛 | **Dracula** | Deep purple and blood red |
-| ⚔ | **Bloodborne** | Gothic crimson and ash |
-| ⬚ | **Ice** | Pale blue and white |
-| 🌊 | **Abyss** | Deep ocean darkness |
-
-Your theme choice is saved per browser.
-
----
-
-## 🎤 Voice Chat
+## Voice Chat
 
 1. Join a text channel first
 2. Click **🎤 Join Voice** in the channel header
@@ -568,9 +923,9 @@ Your theme choice is saved per browser.
 4. Click **🔇 Mute** to toggle your mic
 5. Click **📞 Leave** to disconnect from voice
 
-Voice chat is **peer-to-peer** — audio goes directly between you and other users, not through the server.
+Voice chat is **peer-to-peer** by default: audio goes directly between you and other users, not through the server. Big servers can turn on the optional voice relay instead (Settings, Large Server Setup).
 
-> Voice requires HTTPS. If you're running locally, use `https://localhost:3000`. For remote connections, use `https://YOUR_IP:3000`.
+> Voice needs a secure connection. On the server itself, `http://localhost:3000` or `https://localhost:3000` both work. From any other device, use `https://YOUR_IP:3000`.
 
 ### TURN Server (Voice Over the Internet)
 
@@ -588,6 +943,10 @@ tls-listening-port=5349
 realm=your-domain.com
 use-auth-secret
 static-auth-secret=YOUR_RANDOM_SECRET_HERE
+
+# Only if coturn is behind a router (home server, NAT'd VM, Docker bridge).
+# Leave this out when the machine holds its public IP directly.
+external-ip=YOUR_PUBLIC_IP
 ```
 
 Then add to your Haven `.env`:
@@ -599,13 +958,83 @@ TURN_SECRET=YOUR_RANDOM_SECRET_HERE
 
 Restart Haven, and voice/screen sharing will work across any network.
 
+> **You can set this in the app instead:** **Settings → Admin → 📡 Voice & Connectivity** configures the same STUN and TURN servers without touching `.env`, and it applies without restarting.
+
+> **Which one wins:** a TURN server set in Settings takes precedence, and the `TURN_*` environment variables are ignored while it's filled in. The env vars only apply when the in-app TURN field is empty. If you set `TURN_URL` in `.env` and nothing seems to change, open Settings and clear the field there. `TURN_SECRET` (time-limited HMAC credentials) is environment-only, and is skipped entirely once a TURN server is configured in the app.
+
 > **Docker users:** Add `TURN_URL` and `TURN_SECRET` as environment variables in your `docker-compose.yml`. See the commented example in the default compose file.
 
-> **Oracle Cloud / cloud VMs:** Make sure ports 3478 (UDP+TCP) and 49152–65535 (UDP) are open in your security group / firewall rules. These are needed for TURN relay traffic.
+> **Oracle Cloud / cloud VMs:** Make sure ports 3478 (UDP+TCP) and 49152 to 65535 (UDP) are open in your security group / firewall rules. These are needed for TURN relay traffic.
+
+> **Home server behind a router:** this is where TURN most often looks configured but silently does nothing, because coturn has no idea it is behind NAT and hands out its LAN address as the relay. Three things to get right:
+>
+> - Set `external-ip=YOUR_PUBLIC_IP` in `turnserver.conf`. Without it every relay candidate points at a private address that nobody outside your network can reach. It wants a literal IP, not a hostname, so if yours is dynamic you have to update the line and restart coturn when it changes.
+> - Forward **UDP**, not just TCP. TURN media is UDP: port 3478 plus the whole `min-port` to `max-port` range. A TCP-only forward lets coturn start up, answer, and relay nothing.
+> - Turn on NAT reflection (also called hairpin NAT) on your router, or people on your own LAN cannot reach `turn:your-domain.com`, because that name resolves to your public IP. pfSense and OPNsense call it NAT Reflection. Some routers do not support it at all, in which case split DNS pointing the name at the LAN address is the way round it.
+>
+> The quickest check is inside Haven: Settings, Voice & Connectivity, **Test voice connectivity**. It runs your STUN and TURN the same way a call does and tells you which one is not answering and why. Bear in mind it runs from your browser, so a server that only answers on your own network passes there and still fails for everyone else.
+>
+> To check the relay outside Haven entirely, put your TURN URL and credentials into the WebRTC project's Trickle ICE page (https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/). If it never produces a candidate of type `relay`, the problem is coturn or the firewall in front of it, not Haven.
+
+> **coturn is not the only option.** [eturnal](https://eturnal.net/) does the same job and several people running Haven at home have found it easier to get working. The setting that matters is the same one under a different name: `relay_ipv4_addr` in `eturnal.yml` is coturn's `external-ip`, and its autodetection does not reliably find your public address behind NAT, so set it explicitly there too. Everything else on this page (UDP forwarding, the relay port range, NAT reflection) applies unchanged, and Haven does not care which one you point `TURN_URL` at.
 
 ---
 
-## 🔔 Push Notifications
+## Rich Presence (What You're Playing & Listening To)
+
+Haven can show your current game or track next to your name in the member list,
+and on your profile card. Games take priority in the member list so the sidebar
+stays readable; your profile card shows both if you're doing both.
+
+**This is off until you turn it on.** Nothing is shared until you link an
+account.
+
+### Linking your accounts
+
+1. Click **⚙️ Settings** → **Connections**
+2. Pick a source and follow the prompt:
+
+| Source | What you do | What it covers |
+|--------|-------------|----------------|
+| **Haven's music player** | Nothing, it just works | Anything playing in a Haven voice channel |
+| **Last.fm** ⭐ | Enter your username | Spotify, Apple Music, YouTube Music, Navidrome, Plex |
+| **Steam** | Click Link and sign in | Games |
+| **Spotify** | Click Link and sign in | Spotify only |
+
+**Last.fm is the one to pick for music.** It's just a username, there's no
+sign-in redirect and nothing gets stored, and because most music apps scrobble
+to Last.fm, that single connection covers whatever you actually listen with.
+
+> Scrobbling has to be turned on in Last.fm's own settings first. Haven's setup
+> panel walks you through it for each app.
+
+### Controlling what people see
+
+- **Master switch**: turn presence off entirely
+- **Per-category**: show games but not music, or the other way round
+- **Invisible**: while your status is Invisible, nothing is shared, regardless
+  of the settings above
+
+None of it is written to the database. Presence lives in memory and disappears
+when the server restarts.
+
+### If nothing is showing up
+
+- Give it a minute. Haven checks for updates on a timer rather than instantly.
+- For music, confirm the track actually appears on your Last.fm profile. If it
+  isn't scrobbling there, Haven has nothing to read.
+- For Steam, your Steam profile's game details must be set to **Public**.
+  Steam's API returns nothing for private profiles.
+- Check that your status isn't set to Invisible.
+
+**Admins:** each provider needs a free API key before anyone can link to it.
+Settings → Connections has a **Set up** button per provider with a link to where
+that key comes from, and keys are saved without a restart. To swap a key later,
+use **Change key** on that row.
+
+---
+
+## Push Notifications
 
 Push notifications let you receive alerts when someone messages a channel you're in, even when the Haven tab is in the background or closed.
 
@@ -613,14 +1042,14 @@ Push notifications let you receive alerts when someone messages a channel you're
 
 - **HTTPS is required.** Push notifications use Service Workers, which only work over `https://` or `localhost`. If you're accessing Haven via a LAN IP like `http://192.168.1.x:3000`, push will **not** work.
 - A modern browser (Chrome, Edge, Firefox, or Safari 16+)
-- Haven must be running with SSL certificates (the default if OpenSSL is installed)
+- Haven must be running with SSL certificates (the default; Haven makes its own)
 
 ### How to Enable
 
 1. Open Haven in your browser via `https://` (e.g., `https://localhost:3000` or `https://your-domain:3000`)
 2. Click the **⚙️ Settings** button (bottom of the right sidebar)
 3. Scroll to **Push Notifications** and flip the toggle **on**
-4. Your browser will ask for notification permission — click **Allow**
+4. Your browser will ask for notification permission. Click **Allow**
 5. The status should change to **Enabled**
 
 ### Setting Up on Your Devices
@@ -639,7 +1068,7 @@ Push notifications let you receive alerts when someone messages a channel you're
 - Requires **Safari 16.4+** (iOS 16.4 or later)
 - First, **Add to Home Screen**: tap Share → "Add to Home Screen"
 - Open Haven from the home screen icon (it runs as a web app)
-- Enable push in Settings — Safari will ask for permission
+- Enable push in Settings. Safari will ask for permission
 
 ### Troubleshooting Push
 
@@ -649,42 +1078,83 @@ Push notifications let you receive alerts when someone messages a channel you're
 | "Requires HTTPS" | Access Haven via `https://` instead of `http://` |
 | "Permission denied" | You blocked notifications. Reset in browser settings: Settings → Site Settings → Notifications → find Haven → Allow |
 | Toggle is grayed out | Your browser doesn't support push, or you're in incognito/private mode |
-| Notifications not appearing | Check your OS notification settings — Haven notifications may be muted at the system level |
-| Only works on localhost | For LAN/remote access, you need valid SSL. Haven auto-generates self-signed certs if OpenSSL is installed |
+| Notifications not appearing | Check your OS notification settings. Haven notifications may be muted at the system level |
+| Only works on localhost | For LAN/remote access, you need valid SSL. Haven generates self-signed certs itself on first start |
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
-All settings are in the `.env` file in your **data directory**:
+Haven creates a `.env` config file automatically on first launch. You do not need
+to create or rename anything. It lives in your **data directory**:
 
 | OS | Data Directory |
 |----|---------------|
 | Windows | `%APPDATA%\Haven\` |
 | Linux / macOS | `~/.haven/` |
 
-| Setting | What it does |
-|---------|-------------|
-| `PORT` | Server port (default: 3000) |
-| `ADMIN_USERNAME` | Which username gets admin powers |
-| `JWT_SECRET` | Auto-generated security key — don't share this |
-| `HAVEN_DATA_DIR` | Override where data is stored |
+| Setting | Default | What it does |
+|---------|---------|-------------|
+| `PORT` | `3000` | Server port |
+| `SERVER_NAME` | `Haven` | Your server's display name |
+| `ADMIN_USERNAME` | `admin` | Register with this name to get admin powers |
+| `JWT_SECRET` | *(auto-generated)* | Security key. Do not share or edit this |
+| `HAVEN_DATA_DIR` | *(see above)* | Override the data directory location |
+| `HAVEN_DISK_RESERVE_MB` | `512` | Disk space Haven keeps free so a full server stays fixable |
+| `SSL_CERT_PATH` | *(auto-detected)* | Path to SSL certificate. With Let's Encrypt, point at `fullchain.pem` rather than `cert.pem`: `cert.pem` leaves out the intermediate certificate, which browsers quietly work around but curl and many other clients reject |
+| `SSL_KEY_PATH` | *(auto-detected)* | Path to SSL private key |
+| `STEAM_API_KEY` | *(empty)* | Steam Web API key for rich presence. Get yours at [steamcommunity.com/dev/apikey](https://steamcommunity.com/dev/apikey) (any domain works) |
+| `OIDC_CLIENT_SECRET` | *(empty)* | Client secret for single sign-on. Kept out of the database on purpose, so backups never carry it |
+| `PUBLIC_URL` | *(auto-detected)* | Your server's public address, including `https://`. Only needed if Haven cannot work it out itself, see below |
+| `HAVEN_ALLOW_PRIVATE_CALLBACKS` | `false` | Let bot callback URLs point at private addresses (`10.x`, `192.168.x`, `localhost`, `.local`). Off by default so a webhook cannot be pointed at your internal network. Turn it on only if your bot really does run on the same LAN or in a sibling Docker container. Cloud metadata addresses (`169.254.x.x`) stay blocked regardless |
 
-> `.env` is created automatically on first launch. If you change it, restart the server.
+After editing `.env`, restart the server.
+
+> **Running Haven as a systemd service?** systemd runs the unit as the user you set
+> in `User=` (often `root`), so `~/.haven/` resolves to that user's home (e.g.
+> `/root/.haven/`), *not* the directory you ran Haven from manually during testing.
+> Set `HAVEN_DATA_DIR` to an absolute path in your `.env` or the unit's
+> `Environment=` line so manual and service runs share the same data, certs, and
+> `.env`. Example:
+> ```
+> Environment=HAVEN_DATA_DIR=/opt/haven-data
+> ```
+
+> **Steam or Spotify linking sending people to the wrong address?** If you run Haven
+> behind Docker port mapping (say `8080:3000`), a reverse proxy that strips the port
+> out of the Host header, or a Cloudflare Tunnel, the server cannot reliably guess
+> its own public address, so those sign-in round-trips fail. Set it explicitly:
+> ```
+> PUBLIC_URL=https://haven.example.com:8443
+> ```
+> For security this one is `.env`-only and deliberately **not** editable from the
+> admin panel. A callback address that could be changed from the web UI would be a
+> way to hijack sign-in redirects.
+
+### Running More Than One Server
+
+You can run several Haven instances on the same machine. Each one needs its own
+copy of Haven, its own port, and its own data directory so the databases do not
+conflict.
+
+1. Copy the Haven folder to a separate directory for each server.
+2. In each copy, set a unique `PORT` in `.env` (e.g. `3000`, `3001`).
+3. Set a unique `HAVEN_DATA_DIR` in each `.env` (e.g. `HAVEN_DATA_DIR=C:\HavenData\server1`).
+4. Start each one independently with `Start Haven.bat` (or `start.sh`).
 
 ---
 
-## 💡 Tips
+## Tips
 
-- **Bookmark the URL** — so you don't have to type the IP every time
-- **Keep the bat window open** — closing it stops the server
-- **Your data is stored separately** — all messages, config, and uploads are in your data directory (`%APPDATA%\Haven` on Windows, `~/.haven` on Linux/macOS), not in the Haven code folder
-- **Back up your data directory** — copy it somewhere safe to preserve your chat history
-- **Channel codes are secrets** — treat them like passwords. Anyone with the code can join.
+- **Bookmark the URL**, so you don't have to type the IP every time
+- **Keep the bat window open**: closing it stops the server
+- **Your data is stored separately**: all messages, config, and uploads are in your data directory (`%APPDATA%\Haven` on Windows, `~/.haven` on Linux/macOS), not in the Haven code folder
+- **Back up your data directory**: copy it somewhere safe to preserve your chat history
+- **Channel codes are secrets**: treat them like passwords. Anyone with the code can join.
 
 ---
 
-## 🔐 End-to-End Encryption (E2E)
+## End-to-End Encryption (E2E)
 
 All direct messages in Haven are **end-to-end encrypted**. The server never has access to the plaintext of your DMs or the keys needed to decrypt them.
 
@@ -692,28 +1162,28 @@ All direct messages in Haven are **end-to-end encrypted**. The server never has 
 
 - When you first log in, your browser generates an **ECDH P-256 key pair**.
 - The private key is encrypted (wrapped) with a key **derived from your password** using PBKDF2, and the encrypted blob is stored on the server for cross-device sync.
-- The server **never sees** your password-derived wrapping key — it's computed in your browser and never transmitted.
+- The server **never sees** your password-derived wrapping key. It's computed in your browser and never transmitted.
 - When you message someone, both users' public keys are combined via ECDH + HKDF to produce a shared AES-256-GCM encryption key. Messages are encrypted before leaving your browser.
 
 ### When Keys Are Preserved (Old Messages Readable)
 
 | Scenario | Why it works |
 |---|---|
-| Close the tab and reopen it | IndexedDB still has your keys — no password needed |
-| Refresh the page | Same — IndexedDB survives refreshes |
+| Close the tab and reopen it | IndexedDB still has your keys; no password needed |
+| Refresh the page | Same: IndexedDB survives refreshes |
 | JWT auto-login (return visit) | IndexedDB has the keys cached |
 | Log in on a new device/browser | You type your password → wrapping key is derived → server backup is downloaded and unwrapped |
-| Clear cookies (but NOT site data) | IndexedDB is site data, not cookies — keys survive |
-| Change your password | Private key is re-wrapped with the new password and re-uploaded — the ECDH key pair itself doesn't change |
+| Clear cookies (but NOT site data) | IndexedDB is site data, not cookies, so keys survive |
+| Change your password | Private key is re-wrapped with the new password and re-uploaded (the ECDH key pair itself doesn't change) |
 
 ### When Keys Are Lost (Old Messages Permanently Unreadable)
 
 | Scenario | Why keys are lost |
 |---|---|
-| Clear all browser/site data when that's your only device | IndexedDB is wiped — on re-login the server backup may still unwrap if password hasn't changed |
-| Clear browser data **after** changing your password | Server backup was wrapped with the old password — new password can't unwrap it → new keys generated |
-| Manually reset encryption keys (🔄 button in DM header) | Intentional wipe — new key pair, old messages unreadable |
-| Admin deletes your account or resets the database | Server backup gone — if IndexedDB is also empty, fresh keys are generated |
+| Clear all browser/site data when that's your only device | IndexedDB is wiped. On re-login the server backup may still unwrap if password hasn't changed |
+| Clear browser data **after** changing your password | Server backup was wrapped with the old password; new password can't unwrap it → new keys generated |
+| Manually reset encryption keys (🔄 button in DM header) | Intentional wipe: new key pair, old messages unreadable |
+| Admin deletes your account or resets the database | Server backup gone. If IndexedDB is also empty, fresh keys are generated |
 
 **Short version:** Same password + at least one of (IndexedDB **or** server backup) = keys survive. Lost both = old messages gone forever.
 
@@ -721,12 +1191,12 @@ All direct messages in Haven are **end-to-end encrypted**. The server never has 
 
 | Attack vector | Can they read messages? | Why |
 |---|---|---|
-| Server admin reading the database | **No** | Encrypted private key is wrapped with a key derived from YOUR password — admin has the blob but not the key |
-| Someone with physical server access | **No** | Same reason — the blob is useless without your password |
+| Server admin reading the database | **No** | Encrypted private key is wrapped with a key derived from YOUR password; admin has the blob but not the key |
+| Someone with physical server access | **No** | Same reason: the blob is useless without your password |
 | Man-in-the-middle on the network | **No** | Messages are encrypted client-side before transmission |
-| Stolen JWT token | **No** | JWT authenticates you, but E2E keys live in your browser's IndexedDB — attacker can't unwrap the server backup without your password |
-| Someone who knows your password + has your JWT | **Yes** | Equivalent to using your login — they can derive the wrapping key and decrypt everything |
-| Modified server JavaScript | **Yes** | If the admin pushes tampered JS that exfiltrates keys, all bets are off — this is true of every web-based E2E system |
+| Stolen JWT token | **No** | JWT authenticates you, but E2E keys live in your browser's IndexedDB. Attacker can't unwrap the server backup without your password |
+| Someone who knows your password + has your JWT | **Yes** | Equivalent to using your login: they can derive the wrapping key and decrypt everything |
+| Modified server JavaScript | **Yes** | If the admin pushes tampered JS that exfiltrates keys, all bets are off. This is true of every web-based E2E system |
 
 ### Resetting Encryption Keys
 
@@ -738,21 +1208,404 @@ In any DM conversation, click the **🔄** button in the channel header to reset
 
 ### Verifying Encryption
 
-Click the **🔐** button in the DM header to view your **safety number** — a 60-digit code derived from both users' public keys. Compare it with your conversation partner through a separate channel (phone, in person, etc.). If they match, no one is intercepting your conversation.
+Click the **🔐** button in the DM header to view your **safety number**, a 60-digit code derived from both users' public keys. Compare it with your conversation partner through a separate channel (phone, in person, etc.). If they match, no one is intercepting your conversation.
 
 ---
 
-## 🤖 Bot & Webhook Developer Guide
+## Ferry (Discord Bridge)
 
-Haven has a built-in bot API powered by webhooks. Bots can send messages, delete messages, play soundboard sounds, and register custom slash commands.
+Ferry relays messages between your Haven channels and Discord channels. Haven users
+appear on Discord under their own names, and Discord messages show up in Haven.
 
-> **Looking for ready-made bots and webhooks?** The community library at [**ancsemi/haven-community**](https://github.com/ancsemi/haven-community) collects user-contributed integrations you can deploy as-is — a GitHub releases poster, etc. PRs welcome there if you've built one of your own. See its [`CONTRIBUTING.md`](https://github.com/ancsemi/haven-community/blob/main/CONTRIBUTING.md) for how to submit.
+The same bot can also copy your Discord server's history into Haven: see [Importing from Discord](#importing-from-discord).
+
+**Every Haven server needs its own Discord bot.** Haven cannot ship a shared one:
+Discord caps unverified applications at 100 servers and verification requires a company
+review. Setting one up takes a couple of minutes and is free.
+
+### 1. Create the Discord bot
+
+1. Go to [discord.com/developers/applications](https://discord.com/developers/applications) and click **New Application**
+2. Open the **Bot** tab
+3. Turn on **Message Content Intent**. Without it Discord sends every message with an
+   empty body, so nothing reaches Haven
+4. If you want the Discord DM feature, also turn on **Server Members Intent**
+5. Click **Reset Token**, then copy the token. Treat it like a password
+
+### 2. Connect it to Haven
+
+1. In Haven, go to **Settings → Admin → Ferry**
+2. Click **Set up Ferry** and paste the token
+3. Haven checks the token with Discord and then shows an invite link
+4. Open the invite link and add the bot to your Discord server. Keep the
+   **Manage Webhooks** permission checked: it is what lets relayed messages carry the
+   Haven author's name and picture instead of all arriving as one anonymous bot
+5. Back in Haven, turn on the **Ferry is on** switch
+
+**Private channels.** Discord keeps private channels hidden from the bot until its role
+is added to them, even when the bot can see everything else on the server. Haven marks
+those channels with a 🔒 when you pair or import. For each private channel you want
+bridged or imported:
+
+1. In Discord, right-click the channel and pick **Edit Channel**
+2. Open **Permissions**. Under **Advanced permissions**, click **+** and pick the bot's
+   role (it has the same name as the bot)
+3. Set **View Channel** and **Read Message History** to the green check, then save
+
+Don't give the bot **Administrator** to get around this. It works, but then anyone who
+gets hold of the bot's token controls your whole Discord server.
+
+### 3. Pair some channels
+
+A pairing joins one Haven channel to one Discord channel. Each pairing has two settings:
+
+| Setting | Options |
+|---|---|
+| **Direction** | Two-way, Haven → Discord only, or Discord → Haven only |
+| **Outgoing** | **On command** (only messages addressed with `=>`) or **Mirror everything** (every message in the channel) |
+
+Pairings are also the boundary: members can only send to Discord channels paired with
+the Haven channel they are in. They cannot reach other servers the bot happens to
+belong to.
+
+#### Forums
+
+A Haven forum channel pairs with a Discord forum (or media) channel, and only with one.
+A chat channel pairs with a Discord text or announcement channel. The pairing form only
+offers the matching kind once you pick the Haven channel, and Haven refuses a mixed pair.
+
+- A new post on Discord becomes a new topic in the Haven forum: the post's name is the
+  title, its first message is the body, and any tags with the same name in both forums
+  carry over. Messages in the post become replies in the topic
+- A new topic in Haven becomes a new post in the Discord forum, under the author's
+  Haven name and picture, with the shared tags. Replies in the topic go into that post
+- Forum pairings always carry every post and reply, so they have no **Outgoing** setting
+- Only posts made after you pair cross. Replies in older posts stay on their own side
+- Editing the first message or a reply on Discord updates the Haven copy. For a topic
+  that started on Discord, renaming or retagging the post updates the topic, and locking
+  it closes the topic. Edits made in Haven stay in Haven, the same as chat messages
+- Deleting a post on Discord unlinks it, and closes its Haven topic if the topic started
+  on Discord. Deleting a topic in Haven unlinks it too, and the Discord post stays.
+  Removing the pairing forgets every link between its topics and posts
+- If the Discord forum requires a tag on every post, give the Haven forum a tag with the
+  same name as one of the Discord tags and use it on topics. Tags only Discord moderators
+  may set are never applied from Haven
+
+Forums need nothing extra on Discord: no new intent and no new permission. The bot
+needs to see the forum and have **Manage Webhooks** there, the same as for a text
+channel.
+
+### 4. Grant the permission
+
+Sending to Discord needs the **Send to Discord (Ferry)** role permission
+(`use_ferry`), granted under **Settings → Roles**. Admins always have it. Without it a
+member's messages stay in Haven even in a mirrored channel.
+
+### Sending a message
+
+In a **mirrored** channel, just talk. Everything crosses.
+
+In an **on command** channel, start the message with `=>` and pick a destination from
+the autocomplete:
+
+```
+=>My Server#general hey everyone
+```
+
+The `=>` prefix is stripped before the message is stored, and a small badge on the
+message shows where it went. If the destination does not match a pairing, the prefix
+stays visible so you can see it did not send.
+
+To DM a Discord user (when the admin has enabled it), type `=>@` and search by name:
+
+```
+=>@Alice quick question
+```
+
+### Things worth knowing
+
+- **DMs are one way.** A bot cannot impersonate in a DM, so the message arrives from the
+  bot with your Haven name in the body. Replies stay in Discord and do not come back to
+  Haven. Discord also flags bots that DM a lot of people, so use it sparingly
+- **Pings are off by default.** Relayed messages do not ping anyone on Discord unless an
+  admin turns on **Allow pings**. Even then `@everyone` and role pings stay blocked
+- **Pictures and files sent in Haven are uploaded to Discord** with the message, up to
+  Discord's 10 MB a file and ten files a message. A bigger one shows as a note instead.
+  Attachments sent with a `=>` target go to that target (or that Discord DM) too, and a
+  spoilered picture arrives as a Discord spoiler
+- **Set `PUBLIC_URL`** in your `.env` if you want Haven avatars to appear on the Discord
+  side, and files too big for Discord to show as links. Discord has to be able to reach
+  them over the internet. Without it names still come through, just without avatars
+- **Reactions cross both ways** on messages Ferry carried. A reaction on Discord shows on
+  the Haven copy with the person's Discord name. A reaction in Haven makes the bot react
+  on Discord, once per emoji, since Discord only lets a bot react as itself; it stays
+  while anyone who may send to Discord has that emoji on the message. The bot needs
+  **Add Reactions** in the channel. Custom emoji cross when the other side has one with
+  the same name
+- **Discord attachments arrive as links**, and Discord's own links expire after about a
+  day. The text of the message is permanent, the pictures are not
+- **Other Discord bots are ignored** unless an admin turns on **Relay other bots**,
+  which can flood a channel
+- **Personas are off by default.** With them off, a relayed message always carries the
+  sender's real Haven name so a Discord server cannot be addressed by an untraceable alias
+
+### If it stops working
+
+The Ferry panel shows the connection state and the last error on each pairing.
+
+| Message | Fix |
+|---|---|
+| Discord refused the Message Content intent | Turn it on in the Developer Portal, Bot tab |
+| Discord rejected the bot token | Reset the token in the portal and paste the new one |
+| The bot needs "Manage Webhooks" | Give the bot that permission in the Discord channel |
+| Nothing ever arrives from a private Discord channel | Add the bot's role to that channel (see [Private channels](#2-connect-it-to-haven)) |
+| Discord refused the Server Members intent | Turn it on in the portal, or leave DMs off |
+| This pairing joins a forum to a channel that is not a forum | A paired Haven channel was switched to or from a forum. Remove the pairing and pair matching kinds |
+| That Discord forum requires a tag on every post | Add a Haven forum tag named like one of the Discord forum's tags and tag the topic with it |
+
+---
+
+## Slash Commands & Shortcuts
+
+Type `/` in the message box to see the full list with descriptions. A selection:
+
+| Command | What it does |
+|---------|-------------|
+| `/gif <query>` | Search and send a GIF inline |
+| `/play <name or url>` | Search and play music in the voice channel |
+| `/poll [question]` | Open the poll creator |
+| `/time 8pm` | Insert a time everyone reads in their own timezone |
+| `/roll 2d20` | Roll dice (any NdN format) |
+| `/flip` | Flip a coin |
+| `/me does something` | Italic action text |
+| `/spoiler secret text` | Hidden spoiler text |
+| `/tts hello` | Text-to-speech (`/tts:stop` to stop playback) |
+| `/nick NewName` | Change your username |
+| `/hug @user` | Send someone a hug |
+| `/shrug` `/tableflip` `/unflip` `/lenny` `/disapprove` | Text faces |
+| `/afk` `/brb` `/bbs` | Away announcements |
+| `/clear` | Clear your own chat view |
+
+Bots can register their own slash commands too, see the developer guide below.
+
+### Timestamps that follow the reader
+
+A message can carry an instant rather than a wall-clock time, so everyone sees
+it on their own clock. Useful when the group is spread across timezones: you say
+one time, nobody does the arithmetic, and nobody turns up an hour late.
+
+`/time 8pm` puts a token like `<t:1780853820:f>` in your message box. Type around
+it and send. Whoever reads it sees their own local time. The clock button next to
+the poll button, or `/time` on its own, opens a picker instead: pick the date and
+time, see every style previewed in your own locale, and insert the one you want.
+
+What `/time` accepts:
+
+| You type | Means |
+|----------|-------|
+| `/time 8pm` or `/time 20:00` | Today at that time, or tomorrow if it already went by |
+| `/time tomorrow 9am` | Tomorrow at nine |
+| `/time 2026-09-06 20:30` | That exact date and time |
+| `/time 2026-09-06` | Just the date |
+| `/time +2h` | Two hours from now (`m`, `h`, `d`, `w` all work) |
+| `/time 1780853820` | A unix timestamp you already have |
+
+Everything you type is read in **your** timezone. Add a style letter to change
+how it looks, for example `/time 8pm R`:
+
+| Letter | Looks like |
+|--------|-----------|
+| `t` | 8:17 PM |
+| `T` | 8:17:00 PM |
+| `d` | 09/06/2026 |
+| `D` | September 6, 2026 |
+| `f` (default) | September 6, 2026 at 8:17 PM |
+| `F` | Sunday, September 6, 2026 at 8:17 PM |
+| `R` | in 3 hours (counts itself down) |
+
+Hovering any of them shows the full date and time spelled out. This is the same
+syntax Discord uses, so tokens survive the Ferry bridge in both directions and
+the timestamp generators people already use work here too.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Shift+Enter` | New line (on a phone or tablet, plain `Enter` is a new line and the Send button sends) |
+| `Ctrl+F` | Search messages |
+| `@` | Mention autocomplete |
+| `:` | Emoji autocomplete (type 2+ characters) |
+| `/` | Slash command autocomplete |
+| `::` | Persona autocomplete (send as one of your personas) |
+| `Tab` | Accept the highlighted suggestion |
+
+### Mentioning a role
+
+`@Moderators` (or any role name) lights up for everyone who holds that role and
+pings them the way an @mention does. It shows up in the `@` picker for anyone
+with the **Mention everyone** permission, and the server quietly disarms it for
+anyone without, since a role ping reaches a crowd the same way `@everyone` does.
+Anyone who would rather not be pinged by their roles can turn **@Role mentions**
+off under Settings, Sounds.
+
+---
+
+## Admin & Moderation
+
+Admin controls live in **Settings** (the gear icon in the sidebar). If you
+registered with the admin username you have all of them; everything below can also
+be handed to others through the role system, one permission at a time.
+
+- **Members**: kick, timed mute, ban, unban, delete an account to free the username
+- **Roles**: granular per-channel permissions, including a server-wide "see every
+  channel" permission that only the owner can grant
+- **Automod**: checks links in messages, edits, DMs, profiles and channel topics
+  against a domain policy you control, and rejects them before they are saved. This
+  matters more than it sounds: Haven renders linked images and previews from the
+  other site, so a hostile link exposes the IP of everyone who scrolls past it
+- **Audit log**: a record of channel changes, role updates, bans, kicks and server
+  setting changes, with who did what
+- **Guests**: an optional "Join as Guest" button on the login page. Guests pick a
+  username, get a temporary account with no password, see only the channels you
+  whitelist, cannot DM, and are deleted when they disconnect
+- **Uploads & limits**: max upload size (25 MB by default, raise it as far as your
+  disk allows), attachments per message (10 by default), max message length,
+  per-member storage usage
+- **Auto-cleanup**: automatic deletion of messages past a chosen age, or of the
+  oldest messages once the database or the uploads folder passes a size you
+  set (for uploads, only messages with files go, and pinned and archived ones
+  stay), and how long the files left behind by deleted messages and channels are kept before
+  they are removed for good (a week by default)
+- **Server updates**: check for a new Haven release and apply it in place. Haven
+  takes a pre-update backup and restarts itself
+
+---
+
+## Backing Up Your Data
+
+All your data lives in a dedicated directory **outside** the Haven code folder:
+
+| OS | Location |
+|----|----------|
+| Windows | `%APPDATA%\Haven\` |
+| Linux / macOS | `~/.haven/` |
+
+Inside you will find `haven.db` (messages, users, channels), `.env`, `certs/`, and
+`uploads/`. Copying that whole folder somewhere safe backs up everything. The Haven
+code directory holds no personal data.
+
+### Built-in backups
+
+You do not have to copy files by hand. **Settings → Admin → Backup**
+has:
+
+- **One-click export**: download an archive, with checkboxes for what to include
+  (channels and roles, users, server settings, messages, uploaded files, and
+  optionally DMs)
+- **Scheduled auto-backups**: on a daily or weekly schedule
+- **Restore**: upload a backup to restore a server. The previous database and
+  uploads are kept as `.pre-restore` copies for one cycle as a safety net
+- **Restore on a new machine**: the setup wizard (`Install Haven.bat` on Windows,
+  `install.sh` elsewhere) has **Restore from a backup** on its first page, so
+  moving Haven to another computer brings your accounts back without creating a
+  new admin first. The backup needs Messages ticked
+
+Backups stream to and from disk rather than being held in memory, so a large
+uploads folder will not run the server out of RAM.
+
+### Exporting your data
+
+Use this when you need a copy of what your server holds, for your own records or to answer a member who asks what is stored about them.
+
+1. Open **Settings → Admin → Backup**. Only admins see it.
+2. Under **Download Backup**, tick what you want: Channels & roles, Users (account list), Server settings, Messages (chat history), Direct messages and Uploaded files. **Select All** ticks everything.
+3. Press **Download Backup** and enter your admin password (and your two-factor code if you use one). A ZIP file downloads.
+
+What is inside the ZIP:
+
+- `manifest.json`: the Haven version, when the export was made, and what it includes
+- `structure.json` (when you tick Channels & roles, Users or Server settings): those lists as plain JSON, readable in any text editor. Password hashes, two-factor secrets, recovery codes and email addresses are left out
+- `haven.db` (when you tick Messages): a copy of the whole database. It is a SQLite file, so any SQLite viewer opens it. Messages are in its `messages` table with the channel, the sender's user id and the time; the user ids match the `users` list in `structure.json`. Two-factor secrets are removed from the copy, but it still holds every account's email and password hash, so keep the file somewhere safe and do not hand the whole thing to anyone
+- `uploads/` (when you tick Uploaded files): every uploaded picture and file
+
+Direct messages are left out unless you tick them, and even then they are normally end-to-end encrypted: only the people holding the original keys can read those.
+
+Two more ways to get records out:
+
+- **Audit log**: **Settings → Admin → Audit Log → View Audit Log**, then **Export JSON** saves the admin and moderator actions as a JSON file
+- **Automatic backups**: the same section can save the same ZIP on a schedule into the server's data folder. For yearly records, pick Monthly and raise **Keep last N backups**
+
+There is no button that exports one member's data on its own. A backup holds the whole server, so to answer a request about one person, pick their account out of `structure.json` and their messages out of `haven.db`.
+
+---
+
+## GIF Search Setup
+
+Haven's GIF picker is powered by **GIPHY** and needs a free API key.
+
+1. Go to [developers.giphy.com](https://developers.giphy.com/)
+2. Create an account (or sign in)
+3. Click **Create an App** → choose **API**
+4. Name it anything (e.g. "Haven Chat")
+5. Copy the API key
+6. In Haven, as an admin, click the GIF button (🎞️) in the message box and paste the
+   key into the setup prompt
+
+The key is stored server-side, so only admins can see or change it, and every user
+can search GIFs once it is set. No payment is involved; GIPHY's free tier is far more
+than a private server will use. Tenor is no longer supported for new setup; a server
+that already has a Tenor key keeps working until a GIPHY key is set.
+
+KLIPY works as well. Get a key at [klipy.com/developers](https://klipy.com/developers)
+and set `KLIPY_API_KEY` in your `.env` (or Docker environment). If more than one key
+is set, `PREFERRED_GIF_SEARCH` (`klipy`, `giphy` or `tenor`) picks which provider the
+picker uses; without it the server tries GIPHY first, then KLIPY, then Tenor.
+
+---
+
+## Translations
+
+Haven ships in 11 languages: English, French, German, Spanish, Polish, Russian,
+Chinese, Brazilian Portuguese, Persian (فارسی), Japanese (日本語) and Korean
+(한국어). Users pick one in **Settings → Language** or on the login page, and the
+choice is saved per browser. A first visit follows the browser's language.
+
+English is the reference. Polish, Russian and Brazilian Portuguese have been
+reviewed by native speakers; the rest started as machine translations and still
+need a pass, so corrections are genuinely welcome. Persian, Japanese and Korean
+cover about two thirds of the app so far (chat, voice, forums, DMs and the common
+settings); the rest shows in English until someone fills it in.
+
+**Improving a language:** edit `public/locales/{code}.json` and open a PR.
+
+**Adding one:**
+
+1. Copy `public/locales/en.json` to `public/locales/{code}.json`
+2. Translate the values, leaving the keys unchanged
+3. Fill in the `_meta` block with the language name and flag
+4. Add the code to the `SUPPORTED` array in `public/js/i18n.js`
+5. Add an `<option>` to the language selectors in `public/index.html`,
+   `public/app.html` and `public/theme-preview.html`
+6. Add the code to the server's allowed list (`validLocales` in
+   `src/socketHandlers/admin.js` and `default_locale` in `src/serverTemplate.js`)
+
+Missing keys fall back to English per phrase, so a partial translation never breaks
+anything. If you would like to own a language and keep it current, say so in an
+issue.
+
+---
+
+## Bot & Webhook Developer Guide
+
+Haven has a built-in bot API powered by webhooks. Bots can send messages, edit and delete messages, play soundboard sounds, and register custom slash commands.
+
+> **Looking for ready-made bots and webhooks?** The community library at [**ancsemi/haven-community**](https://github.com/ancsemi/haven-community) collects user-contributed integrations you can deploy as-is (a GitHub releases poster, etc.). PRs welcome there if you've built one of your own. See its [`CONTRIBUTING.md`](https://github.com/ancsemi/haven-community/blob/main/CONTRIBUTING.md) for how to submit.
 
 ### Creating a Bot
 
-1. Go to **Settings → Server Admin Settings → Bots** (or open a channel's settings and look for the webhook/bot option)
-2. Create a new webhook — give it a name, optionally set an avatar URL and a callback URL
-3. Copy the **Webhook Token** (64-character hex string) — this is your bot's API key
+1. Go to **Settings → Admin → Bots** (or open a channel's settings and look for the webhook/bot option)
+2. Create a new webhook. Give it a name, optionally set an avatar URL and a callback URL
+3. Copy the **Webhook Token** (64-character hex string). This is your bot's API key
 
 ### Sending Messages
 
@@ -767,11 +1620,14 @@ Content-Type: application/json
 }
 ```
 
-- `content` (required) — message text, max 4000 characters
-- `username` (optional) — override the bot's display name for this message
-- `avatar_url` (optional) — override the bot's avatar for this message
-- `ephemeral` (optional) — when `true`, deliver only to `recipient_id` and do not store in history
-- `recipient_id` (required when `ephemeral` is `true`) — user id that should receive the private bot message
+- `content` (required): message text, max 4000 characters
+- `username` (optional): override the bot's display name for this message (max 32 characters; control characters and `<` `>` are removed)
+- `avatar_url` (optional): override the bot's avatar for this message. It must be an `https://` link or one of this server's `/uploads/` files; anything else is dropped and the message posts with no avatar
+- `ephemeral` (optional): when `true`, deliver only to `recipient_id` and do not store in history
+- `recipient_id` (required when `ephemeral` is `true`): user id that should receive the private bot message
+- `reply_to` (optional): id of a message in the same channel to reply to
+- `thread_id` (optional): id of a top-level message in the bot's channel; the message is posted as a reply inside that thread (not combinable with `ephemeral`)
+- `silent` (optional): when `true`, the message makes no sound, pop-up or push for anyone; starting `content` with `@silent ` does the same
 
 Ephemeral example:
 
@@ -786,9 +1642,50 @@ Content-Type: application/json
 }
 ```
 
-Response (regular): `{ "success": true, "message_id": 123 }`
+Thread example:
+
+```
+POST https://your-server.com/api/webhooks/<token>
+Content-Type: application/json
+
+{
+  "content": "Build finished",
+  "thread_id": 123
+}
+```
+
+Response (regular): `{ "success": true, "message_id": 124 }` (plus `"thread_id": 123` for a thread reply)
 
 Response (ephemeral): `{ "success": true, "ephemeral": true, "recipient_id": 42, "delivered": true }`
+
+### Sending Files and Pictures
+
+A bot can attach up to 10 files to a message by sending `multipart/form-data` instead of JSON. Put the message fields in a `payload_json` part (the same fields as above) and each file in its own part named `files[0]`, `files[1]`, and so on:
+
+```
+curl -F 'payload_json={"content":"Forwarded from Discord"}' \
+     -F 'files[0]=@cat.png' \
+     -F 'files[1]=@notes.pdf' \
+     https://your-server.com/api/webhooks/<token>
+```
+
+- The files are stored on this server, so they never expire the way links to another service's files can. A bot that relays messages from somewhere else should send the files, not their links.
+- Pictures (JPG, PNG, GIF, WebP) show in the message; anything else shows as a file card people can download. Text is optional when there is a file.
+- The same rules as a member's upload apply: the server's upload size limit, the file types the admin blocked, and the privacy pass that removes location data. The upload counts toward the storage of the person who made the bot, and that person must be allowed to upload files.
+- Plain form fields (`content`, `username`, `silent`, ...) work too, if `payload_json` is left out.
+- Files cannot be sent with `ephemeral`, since an ephemeral message is never stored.
+
+
+### Editing Messages
+
+```
+PATCH https://your-server.com/api/webhooks/<token>/messages/<message_id>
+Content-Type: application/json
+
+{ "content": "The new text" }
+```
+
+A bot can edit the messages it posted itself (use the `message_id` it got back when posting), and nobody else's. The message shows as edited. Returns `{ "success": true, "message_id": 124 }`.
 
 ### Deleting Messages
 
@@ -797,6 +1694,17 @@ DELETE https://your-server.com/api/webhooks/<token>/messages/<message_id>
 ```
 
 Bots can delete any message in their assigned channel. Returns `{ "success": true }`.
+
+Bots with moderation permission can delete up to 100 of the most recent messages
+from their assigned channel in one request. Thread replies are removed with their
+parent messages.
+
+```
+DELETE https://your-server.com/api/webhooks/<token>/messages?limit=25
+```
+
+Returns `{ "success": true, "deleted": 25 }`. The `deleted` count includes
+thread replies removed with the selected messages.
 
 ### Playing Soundboard Sounds
 
@@ -867,22 +1775,49 @@ All webhook endpoints are rate-limited to **30 requests per minute** per IP.
 
 If your webhook has a `callback_url` and `callback_secret` configured, Haven will POST command invocations to your URL. The payload includes an HMAC signature in the `X-Haven-Signature` header that you should verify using your callback secret.
 
+### Receiving Messages
+
+A bot with a `callback_url` also hears ordinary chat: every message posted in its channel is sent to that URL as it arrives, so a bot can read what people say and answer with the Sending Messages call above. This is how assistants and chat bridges plug in. Each delivery looks like this:
+
+```
+POST <your callback_url>
+Content-Type: application/json
+X-Haven-Event: message
+X-Haven-Signature: sha256=<HMAC of the body with your callback secret>
+
+{
+  "event": "message",
+  "channelId": "<channel code>",
+  "timestamp": "2026-10-27T18:04:11.000Z",
+  "message": {
+    "id": 1234,
+    "content": "hey bot, what's the weather?",
+    "author": { "id": 7, "username": "alice" },
+    "reply_to": null,
+    "is_webhook": false,
+    "timestamp": "2026-10-27 18:04:11"
+  }
+}
+```
+
+- Bot posts (its own included) are not sent back, so a bot cannot loop on itself.
+- DMs never reach a bot, and a bot only hears its channel while the person who made it can still read that channel.
+- The callback URL must be reachable from the server. A bot on your own network (`192.168.x`, `localhost`, a sibling Docker container) needs `HAVEN_ALLOW_PRIVATE_CALLBACKS=true` in `.env`. A failed delivery is retried once, and the last result shows on the bot's card in Settings.
+
 ---
 
-## 🆘 Troubleshooting
+## Troubleshooting
 
 **"SSL_ERROR_RX_RECORD_TOO_LONG" or "ERR_SSL_PROTOCOL_ERROR" in browser**
-→ Your browser is trying to connect via `https://` but the server is actually running in HTTP mode. This happens when SSL certificates weren't generated (usually because OpenSSL isn't installed).
+→ Your browser is trying to connect via `https://` but the server is actually running in HTTP mode. Haven makes its own self-signed certificate on first start (no OpenSSL needed), so this now only happens when `FORCE_HTTP=true` is set in your `.env`, or when the certificate files in your data directory are unreadable.
 **Quick fix:** Change the URL in your browser from `https://localhost:3000` to `http://localhost:3000`.
-**Permanent fix:** Install OpenSSL so Haven can generate certificates:
-1. Download from [slproweb.com/products/Win32OpenSSL.html](https://slproweb.com/products/Win32OpenSSL.html) (the "Light" version is fine)
-2. During install, choose **"Copy OpenSSL DLLs to the Windows system directory"**
-3. **Restart your PC** (so OpenSSL is added to PATH)
-4. Delete the `certs` folder in your data directory (`%APPDATA%\Haven\certs`)
-5. Re-launch `Start Haven.bat` — it will regenerate certificates and start in HTTPS mode
+**Permanent fix:**
+1. Open `.env` in your data directory (`%APPDATA%\Haven` on Windows, `~/.haven` elsewhere) and remove `FORCE_HTTP=true` unless a reverse proxy is terminating TLS for you
+2. If the startup log says the certificate could not be loaded, delete the `certs` folder in that data directory
+3. Re-launch `Start Haven.bat`. Haven regenerates the certificate and starts in HTTPS mode
 
 **How to tell if you're running HTTP or HTTPS:**
-Check the server's startup banner in the terminal. If it says `http://localhost:3000` — you're on HTTP. If it says `https://localhost:3000` — you're on HTTPS. The protocol in the URL you use must match.
+Check the server's startup banner in the terminal. If it says `http://localhost:3000`, you're on HTTP. If it says `https://localhost:3000`, you're on HTTPS. The protocol in the URL you use must match.
 
 **"Node.js is not installed"**
 → Download and install from [nodejs.org](https://nodejs.org/). Restart your PC after installing.
@@ -902,5 +1837,5 @@ Check the server's startup banner in the terminal. If it says `http://localhost:
 ---
 
 <p align="center">
-  <b>⬡ Haven</b> — Your server. Your rules.
+  <b>⬡ Haven</b>: Your server. Your rules.
 </p>

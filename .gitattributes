@@ -3,6 +3,7 @@
 *.sh text eol=lf
 docker-entrypoint.sh text eol=lf
 Dockerfile text eol=lf
+* text=auto eol=lf
 
 # Force UTF-8 (with a working-tree BOM) on the public landing pages and
 # anything else that holds emoji. PowerShell 5.1's Set-Content defaults to
@@ -14,6 +15,8 @@ docs/index.html        text working-tree-encoding=UTF-8 eol=lf
 website/index.html     text working-tree-encoding=UTF-8 eol=lf
 docs/support.html      text working-tree-encoding=UTF-8 eol=lf
 website/support.html   text working-tree-encoding=UTF-8 eol=lf
+docs/tutorials.html    text working-tree-encoding=UTF-8 eol=lf
+website/tutorials.html text working-tree-encoding=UTF-8 eol=lf
 CHANGELOG.md           text working-tree-encoding=UTF-8 eol=lf
 README.md              text working-tree-encoding=UTF-8 eol=lf
 GUIDE.md               text working-tree-encoding=UTF-8 eol=lf

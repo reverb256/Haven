@@ -1,37 +1,54 @@
-{
+﻿{
   "name": "haven",
-  "version": "3.24.0",
+  "version": "4.30.0-beta.3",
   "description": "Haven - self-hosted private chat for your server, your rules",
   "license": "AGPL-3.0",
   "main": "server.js",
   "engines": {
-    "node": ">=18.0.0 <24.0.0"
+    "node": ">=22.0.0 <27.0.0"
   },
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "node --watch server.js",
+    "test": "node --test --test-concurrency=1"
   },
   "dependencies": {
-    "adm-zip": "^0.5.16",
+    "@ruffle-rs/ruffle": "0.6.0",
+    "adm-zip": "^0.6.0",
+    "archiver": "^7.0.1",
     "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^12.10.0",
+    "better-sqlite3": "^12.11.1",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.1",
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.2",
     "localtunnel": "^2.0.2",
-    "multer": "^2.0.2",
+    "multer": "^2.5.0",
+    "music-metadata": "^11.16.0",
     "otpauth": "^9.5.0",
     "qrcode": "^1.5.4",
+    "semver": "^7.7.4",
     "socket.io": "^4.8.1",
-    "web-push": "^3.6.7"
+    "web-push": "^3.6.7",
+    "ws": "^8.18.3",
+    "yauzl": "^3.4.0"
   },
   "overrides": {
     "bn.js": ">=5.2.3",
-    "axios": ">=1.8.2"
+    "axios": ">=1.8.2",
+    "archiver-utils": {
+      "glob": "^14.0.3"
+    },
+    "minimatch": "^11.0.4"
   },
   "devDependencies": {
-    "innosetup-compiler": "^6.3.1"
+    "esbuild": "^0.28.2",
+    "mediasoup-client": "^3.24.1",
+    "socket.io-client": "^4.8.1"
+  },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "esbuild": true
   }
 }

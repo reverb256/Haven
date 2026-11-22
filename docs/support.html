@@ -3,10 +3,12 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Haven — Help &amp; Support</title>
+  <title>Haven: Help &amp; Support</title>
   <meta name="description" content="Get help with Haven. Troubleshooting, bug reports, and contact info.">
-  <link rel="canonical" href="https://ancsemi.github.io/Haven/support.html">
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⬡</text></svg>">
+  <link rel="canonical" href="https://haven-app.com/support.html">
+  <link rel="icon" href="/favicon.ico" sizes="48x48">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/favicon-192.png">
 
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -254,6 +256,7 @@
       <ul class="nav-links">
         <li><a href="index.html#features">Features</a></li>
         <li><a href="index.html#download">Download</a></li>
+        <li><a href="tutorials.html">Tutorials</a></li>
         <li><a href="support.html" style="color: var(--accent-bright);">Help &amp; Support</a></li>
         <li><a href="https://github.com/ancsemi/Haven" target="_blank" class="nav-cta">GitHub</a></li>
       </ul>
@@ -264,6 +267,7 @@
   <div class="page-header">
     <h1>Help &amp; Support</h1>
     <p>Having trouble? You're in the right place. Most issues have a quick fix.</p>
+    <p>New to Haven? The <a href="tutorials.html">video tutorials</a> walk through installing and running a server.</p>
   </div>
 
   <div class="container">
@@ -298,7 +302,7 @@
             </tr>
             <tr>
               <td>Voice chat not working</td>
-              <td>Voice requires HTTPS <em>or</em> localhost. If friends are connecting over the internet without HTTPS, voice won't work in most browsers. Install <a href="https://slproweb.com/products/Win32OpenSSL.html" target="_blank">OpenSSL</a> and restart Haven to enable HTTPS automatically.</td>
+              <td>Voice requires HTTPS <em>or</em> localhost. If friends are connecting over the internet without HTTPS, voice won't work in most browsers. Haven generates its own certificate on first start, so check the startup log says <code>HTTPS enabled</code> and that <code>FORCE_HTTP</code> is not set in your <code>.env</code>.</td>
             </tr>
             <tr>
               <td>"Port 3000 already in use"</td>
@@ -310,7 +314,7 @@
             </tr>
             <tr>
               <td>GIFs not working</td>
-              <td>The admin needs to set a GIPHY API key. Go to Settings &rarr; Admin &rarr; paste your free key from <a href="https://developers.giphy.com/" target="_blank">developers.giphy.com</a>.</td>
+              <td>The admin needs to set a GIF provider API key. Tenor is the one to use, since GIPHY no longer issues keys to new servers. Click the GIF button as an admin and follow the setup prompt, or see the <a href="https://github.com/ancsemi/Haven/blob/main/GUIDE.md" target="_blank">setup guide</a>.</td>
             </tr>
           </tbody>
         </table>
@@ -330,15 +334,15 @@
         <h3 style="margin-top: 20px;">What to include</h3>
         <p>The more detail you give, the faster we can fix it:</p>
         <ul class="steps-list" style="margin-top: 12px;">
-          <li><p><strong>What happened?</strong> &mdash; Describe what went wrong. "Voice chat disconnects after 2 minutes" is better than "voice broken."</p></li>
-          <li><p><strong>What did you expect?</strong> &mdash; What should have happened instead?</p></li>
-          <li><p><strong>Steps to reproduce</strong> &mdash; What were you doing when it broke? Can you make it happen again?</p></li>
-          <li><p><strong>Your setup</strong> &mdash; Windows/Mac/Linux? Which browser? Are you the host or a guest?</p></li>
+          <li><p><strong>What happened?</strong> Describe what went wrong. "Voice chat disconnects after 2 minutes" is better than "voice broken."</p></li>
+          <li><p><strong>What did you expect?</strong> What should have happened instead?</p></li>
+          <li><p><strong>Steps to reproduce</strong>: What were you doing when it broke? Can you make it happen again?</p></li>
+          <li><p><strong>Your setup</strong>: Windows/Mac/Linux? Which browser? Are you the host or a guest?</p></li>
         </ul>
 
         <h3 style="margin-top: 24px;">How to report</h3>
         <div class="btn-row">
-          <a href="mailto:help.havenapp@gmail.com?subject=Haven%20Bug%20Report&body=What%20happened%3A%0A%0AWhat%20I%20expected%3A%0A%0ASteps%20to%20reproduce%3A%0A%0AMy%20setup%20(OS%2C%20browser)%3A%0A" class="btn btn-primary">
+          <a href="mailto:ancsemi@haven-app.com?subject=Haven%20Bug%20Report&body=What%20happened%3A%0A%0AWhat%20I%20expected%3A%0A%0ASteps%20to%20reproduce%3A%0A%0AMy%20setup%20(OS%2C%20browser)%3A%0A" class="btn btn-primary">
             ✉️ Email Us
           </a>
           <a href="https://github.com/ancsemi/Haven/issues/new" target="_blank" class="btn btn-secondary">
@@ -417,7 +421,7 @@
             <span class="arrow">▼</span>
           </button>
           <div class="faq-a">
-            <p>Absolutely. It's lightweight &mdash; it'll happily run in the background on any modern computer. Some people run it on a Raspberry Pi or an old laptop they leave on.</p>
+            <p>Absolutely. It's lightweight. It'll happily run in the background on any modern computer. Some people run it on a Raspberry Pi or an old laptop they leave on.</p>
           </div>
         </div>
 
@@ -427,7 +431,7 @@
             <span class="arrow">▼</span>
           </button>
           <div class="faq-a">
-            <p>Install <a href="https://slproweb.com/products/Win32OpenSSL.html" target="_blank">OpenSSL</a> (Windows) or use your system's package manager (Mac/Linux). Restart Haven and it'll automatically generate certificates and switch to HTTPS. Check the <a href="https://github.com/ancsemi/Haven/blob/main/GUIDE.md" target="_blank">Setup Guide</a> for full instructions.</p>
+            <p>Haven generates a self-signed certificate itself on first start, no OpenSSL needed. If the log says HTTP, remove <code>FORCE_HTTP=true</code> from your <code>.env</code> (or delete the <code>certs</code> folder in your data directory if the log says the certificate could not be loaded) and restart. Check the <a href="https://github.com/ancsemi/Haven/blob/main/GUIDE.md" target="_blank">Setup Guide</a> for full instructions.</p>
           </div>
         </div>
       </div>
@@ -439,8 +443,8 @@
         <h2>Still stuck?</h2>
         <p>Reach out directly. I usually respond within a day or two.</p>
         <div class="contact-methods">
-          <a href="mailto:help.havenapp@gmail.com?subject=Haven%20Support">
-            <span class="cm-icon">✉️</span> help.havenapp@gmail.com
+          <a href="mailto:ancsemi@haven-app.com?subject=Haven%20Support">
+            <span class="cm-icon">✉️</span> ancsemi@haven-app.com
           </a>
           <a href="https://github.com/ancsemi/Haven/issues/new" target="_blank">
             <span class="cm-icon">📋</span> GitHub Issues
@@ -463,6 +467,7 @@
         <li><a href="index.html">Home</a></li>
         <li><a href="https://github.com/ancsemi/Haven" target="_blank">GitHub</a></li>
         <li><a href="https://github.com/ancsemi/Haven/blob/main/GUIDE.md" target="_blank">Setup Guide</a></li>
+        <li><a href="tutorials.html">Video Tutorials</a></li>
         <li><a href="https://github.com/ancsemi/Haven/blob/main/CHANGELOG.md" target="_blank">Changelog</a></li>
         <li><a href="https://github.com/ancsemi/Haven/blob/main/LICENSE" target="_blank">License</a></li>
       </ul>

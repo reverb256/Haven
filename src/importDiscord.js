@@ -8,6 +8,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { unescapeDiscord } = require('./discordText');
 
 // ── Public entry point ──────────────────────────────────────
 function parseDiscordExport(filePath) {
@@ -53,7 +54,7 @@ function parseZip(filePath) {
   const AdmZip = require('adm-zip');
   let zip;
   try { zip = new AdmZip(filePath); }
-  catch { throw new Error('Could not open ZIP file — it may be corrupt.'); }
+  catch { throw new Error('Could not open ZIP file. It may be corrupt.'); }
 
   const entries = zip.getEntries();
 
@@ -89,7 +90,10 @@ function parseDCEZip(zip, jsonFiles) {
         serverName = r.serverName;
         channels.push(...r.channels);
       }
-    } catch { /* skip unparseable */ }
+    } catch (err) {
+      // Untrusted file: skip it, but say so, or the channel just goes missing from the import.
+      console.warn('[import] Skipped unreadable file in export:', entry.entryName, err.message);
+    }
   }
 
   if (channels.length === 0) {
@@ -110,7 +114,7 @@ function parseOfficialZip(zip, entries) {
     try {
       const g = JSON.parse(zip.readAsText(guildJsons[0]));
       if (g.name) serverName = g.name;
-    } catch {}
+    } catch { /* unreadable guild.json: keep the default server name */ }
   }
 
   // Build channel map from channel.json files
@@ -133,7 +137,9 @@ function parseOfficialZip(zip, entries) {
         messageCount: 0
       };
       if (info.guild?.name) serverName = info.guild.name;
-    } catch {}
+    } catch (err) {
+      console.warn('[import] Skipped unreadable channel file in export:', entry.entryName, err.message);
+    }
   }
 
   // Parse CSV files
@@ -146,7 +152,9 @@ function parseOfficialZip(zip, entries) {
       const msgs = parseCSV(csv);
       ch.messages = msgs;
       ch.messageCount = msgs.length;
-    } catch {}
+    } catch (err) {
+      console.warn('[import] Skipped unreadable messages file in export:', entry.entryName, err.message);
+    }
   }
 
   const channels = Object.values(channelMap).filter(c => c.messageCount > 0);
@@ -166,7 +174,7 @@ function buildDCEResult(data) {
     const type = msg.type || 'Default';
     if (type !== 'Default' && type !== 'Reply') continue;
 
-    let content = msg.content || '';
+    let content = unescapeDiscord(msg.content || '');
     // Append attachment links
     if (Array.isArray(msg.attachments)) {
       for (const a of msg.attachments) {
@@ -188,9 +196,9 @@ function buildDCEResult(data) {
       timestamp: msg.timestamp,
       isPinned: msg.isPinned || false,
       reactions: (msg.reactions || []).map(r => ({
-        emoji: typeof r.emoji === 'string' ? r.emoji : (r.emoji?.name || '❓'),
+        emoji: importedReactionEmoji(r.emoji),
         count: r.count || 1
-      })),
+      })).filter(r => isReactionEmoji(r.emoji)),
       replyTo: msg.reference?.messageId || null
     });
   }
@@ -278,4 +286,21 @@ function splitCSVLine(line) {
   return fields;
 }
 
-module.exports = { parseDiscordExport };
+// Same rule the live add-reaction handler applies: a Unicode emoji or a
+// :custom_name:, at most 32 characters. Anything else is dropped on import.
+const REACTION_EMOJI_RE = /^[\p{Emoji}\p{Emoji_Component}️‍]+$/u;
+const CUSTOM_REACTION_RE = /^:[a-zA-Z0-9_-]{1,30}:$/;
+function isReactionEmoji(emoji) {
+  return typeof emoji === 'string' && emoji.length >= 1 && emoji.length <= 32
+    && (REACTION_EMOJI_RE.test(emoji) || CUSTOM_REACTION_RE.test(emoji));
+}
+
+// Discord exports name a server's own emoji bare ("pepe"). Haven writes those
+// as :pepe:, so they survive the check above instead of being dropped.
+function importedReactionEmoji(raw) {
+  const name = typeof raw === 'string' ? raw : (raw && typeof raw.name === 'string' ? raw.name : '');
+  if (/^[a-zA-Z0-9_-]{1,30}$/.test(name) && !REACTION_EMOJI_RE.test(name)) return `:${name}:`;
+  return name || '\u2753';
+}
+
+module.exports = { parseDiscordExport, isReactionEmoji, importedReactionEmoji };

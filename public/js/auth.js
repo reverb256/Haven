@@ -3,7 +3,7 @@
 (async function () {
   // Preserve invite param across login/register so vanity invite links work for new users
   const _urlParams = new URLSearchParams(window.location.search);
-  const _pendingInvite = _urlParams.get('invite') || sessionStorage.getItem('haven_pending_invite') || '';
+  let _pendingInvite = _urlParams.get('invite') || sessionStorage.getItem('haven_pending_invite') || '';
   if (_pendingInvite) sessionStorage.setItem('haven_pending_invite', _pendingInvite);
   // Preserve channel/message deep-link params (?channel=CODE&message=ID) too
   const _pendingChannel = _urlParams.get('channel') || sessionStorage.getItem('haven_pending_channel') || '';
@@ -11,23 +11,59 @@
   if (_pendingChannel) sessionStorage.setItem('haven_pending_channel', _pendingChannel);
   if (_pendingMessage) sessionStorage.setItem('haven_pending_message', _pendingMessage);
 
-  const _appQuery = (() => {
-    const parts = [];
-    if (_pendingInvite) parts.push('invite=' + encodeURIComponent(_pendingInvite));
-    if (_pendingChannel) parts.push('channel=' + encodeURIComponent(_pendingChannel));
-    if (_pendingMessage) parts.push('message=' + encodeURIComponent(_pendingMessage));
-    return parts.length ? '?' + parts.join('&') : '';
-  })();
-  const _appUrl = '/app' + _appQuery;
+  function _buildAppUrl() {
+    const _appQuery = (() => {
+      const parts = [];
+      if (_pendingInvite) parts.push('invite=' + encodeURIComponent(_pendingInvite));
+      if (_pendingChannel) parts.push('channel=' + encodeURIComponent(_pendingChannel));
+      if (_pendingMessage) parts.push('message=' + encodeURIComponent(_pendingMessage));
+      return parts.length ? '?' + parts.join('&') : '';
+    })();
+    return '/app' + _appQuery;
+  }
+  let _appUrl = _buildAppUrl();
+
+  // (#12) A returning SSO callback stashes its session here and bounces to
+  // this page. Claim it before the already-logged-in check below, so an old
+  // token in localStorage can't send us to the app and strand a fresh login
+  // that still has to set up its encryption passphrase.
+  let _oidcHandoff = null;
+  if (_urlParams.get('oidc') === '1') {
+    try {
+      const raw = sessionStorage.getItem('haven_oidc_handoff');
+      sessionStorage.removeItem('haven_oidc_handoff');
+      if (raw) _oidcHandoff = JSON.parse(raw);
+    } catch { /* malformed handoff, fall through to the normal login page */ }
+    history.replaceState({}, '', window.location.pathname);
+  }
+  const _oidcError = _urlParams.get('oidc_error') || '';
+  if (_oidcError) history.replaceState({}, '', window.location.pathname);
 
   // If already logged in, redirect to app
-  if (localStorage.getItem('haven_token')) {
+  if (!_oidcHandoff && localStorage.getItem('haven_token')) {
     window.location.href = _appUrl;
     return;
   }
 
   // Initialise translations before rendering any UI text
   await window.i18n.init();
+
+  // Opens the app after a password sign-in, with the key that unlocks the
+  // encrypted-DM backup. An account with its own encryption passphrase is not
+  // unlocked from the password (the server receives that at every sign-in,
+  // which is what the passphrase avoids), so it asks for the passphrase.
+  async function enterApp(user, password) {
+    if (user && user.e2ePassphrase) {
+      sessionStorage.removeItem('haven_e2e_wrap');
+      showE2EPassStep(true, (wrapKey) => {
+        if (wrapKey) sessionStorage.setItem('haven_e2e_wrap', wrapKey);
+        window.location.href = _appUrl;
+      }, 'auth.e2e_pass.unlock_desc_own');
+      return;
+    }
+    sessionStorage.setItem('haven_e2e_wrap', await deriveE2EWrappingKey(password));
+    window.location.href = _appUrl;
+  }
 
   // ── E2E wrapping key derivation (mirrors HavenE2E.deriveWrappingKey) ───
   async function deriveE2EWrappingKey(password) {
@@ -45,10 +81,27 @@
   // ── Theme switching ───────────────────────────────────
   initThemeSwitcher('auth-theme-bar');
 
+  // Themes an admin has published are .theme.css files rather than built-in
+  // data-theme values, and plugin-loader.js (which knows about them) only runs
+  // on the app page. So the login page fetched nothing and showed none of them.
+  // /api/themes is unauthenticated, which is what makes this possible here. (#5537)
+  const publishedThemesPromise = (window.HavenThemeCompat?.fetchThemes?.(fetch) || fetch('/api/themes')
+    .then(r => {
+      if (!r.ok) throw new Error(`Theme metadata request failed (${r.status})`);
+      return r.json();
+    }))
+    .then(themes => {
+      if (!Array.isArray(themes)) throw new Error('Invalid theme metadata response');
+      injectPublishedThemeBar('auth-theme-bar', themes);
+      return themes;
+    })
+    .catch(() => null); // Preserve saved choices when theme metadata is temporarily unavailable.
+
   // ── Language switcher ─────────────────────────────────
   const langSelect = document.getElementById('auth-lang-select');
   if (langSelect) {
-    langSelect.value = window.i18n.locale;
+    langSelect.value = window.i18n.preference;
+    window.i18n.buildLocalePicker(langSelect);
     langSelect.addEventListener('change', e => window.i18n.setLocale(e.target.value));
   }
 
@@ -56,19 +109,57 @@
   fetch('/api/version').then(r => r.json()).then(d => {
     const el = document.getElementById('auth-version');
     if (el && d.version) el.textContent = 'v' + d.version;
-  }).catch(() => {});
+  }).catch(() => { /* the version label is cosmetic: leave it blank */ });
+
+  // The login page's look (#5819), from Settings > Branding: the server icon
+  // as a logo, the banner as the background, a message, and the admin's CSS.
+  // Adding ?nocss to the address skips the CSS, for when a style has hidden
+  // the form. The CSS goes in as text, never markup, so it cannot add tags.
+  function applyLoginBranding(d) {
+    const skipCss = new URLSearchParams(location.search).has('nocss');
+    const logo = document.getElementById('auth-server-logo');
+    if (logo && d.login_logo) { logo.src = d.login_logo; logo.hidden = false; }
+    const msg = document.getElementById('auth-login-message');
+    if (msg && d.login_message) { msg.textContent = d.login_message; msg.hidden = false; }
+    if (d.login_background && /^\/uploads\//.test(d.login_background)) {
+      document.body.classList.add('auth-has-background');
+      document.body.style.setProperty('--auth-background', `url("${d.login_background.replace(/["\\]/g, '')}")`);
+    }
+    if (d.login_css && !skipCss) {
+      const style = document.createElement('style');
+      style.id = 'login-custom-css';
+      style.textContent = d.login_css;
+      document.head.appendChild(style);
+    }
+  }
 
   // ── Apply server default theme for first-time visitors ──
   // Only applies when the user has no personal theme preference stored locally.
   // Also fetch server title for login page branding.
-  fetch('/api/public-config').then(r => r.json()).then(d => {
+  fetch('/api/public-config').then(r => r.json()).then(async d => {
     if (d.default_theme && !localStorage.getItem('haven_theme')) {
-      document.documentElement.setAttribute('data-theme', d.default_theme);
+      // A published theme is stored as "file:whatever.theme.css". Writing that
+      // straight into data-theme matched no stylesheet at all, so an admin who
+      // picked a custom theme as the server default got an unstyled login page
+      // on a first visit, and only saw the theme once a later page load found
+      // it in localStorage. Neither branch persists: this is the server's
+      // suggestion for someone who has not chosen, not a choice they made, and
+      // storing it would stop a later change to the default from ever reaching
+      // a returning visitor who has not signed in. (#5537, #5536)
+      if (d.default_theme.startsWith('file:')) {
+        const file = d.default_theme.slice(5);
+        const themes = await publishedThemesPromise;
+        const meta = themes?.find(theme => theme?.file === file);
+        if (meta) applyPublishedThemeBase(file, false, meta);
+      } else {
+        applyThemeFromServer(d.default_theme, false);
+      }
     }
     if (d.server_title) {
       const titleEl = document.getElementById('server-title');
       if (titleEl) titleEl.textContent = d.server_title;
     }
+    applyLoginBranding(d);
     // Tab branding for the login page (issue #5284). Mirrors what the
     // authenticated app does so multi-server tabs stay distinguishable
     // even before signing in.
@@ -96,7 +187,7 @@
         section.style.display = 'block';
       }
     }
-  }).catch(() => {});
+  }).catch((err) => { console.warn('[Auth] could not load the public config', err); });
 
   // ── EULA ─────────────────────────────────────────────
   const ageCheckbox  = document.getElementById('age-checkbox');
@@ -105,6 +196,7 @@
   const eulaLink = document.getElementById('eula-link');
   const eulaAcceptBtn = document.getElementById('eula-accept-btn');
   const eulaDeclineBtn = document.getElementById('eula-decline-btn');
+  const eulaNotice = document.getElementById('eula-notice');
 
   // Restore EULA acceptance from localStorage (v2.0 requires re-acceptance)
   if (localStorage.getItem('haven_eula_accepted') === '2.0') {
@@ -115,6 +207,16 @@
   eulaLink.addEventListener('click', (e) => {
     e.preventDefault();
     eulaModal.style.display = 'flex';
+  });
+
+  // The login consent note links to the same Terms popup. Its anchor is injected
+  // via data-i18n-html and re-created on every language change, so bind it by
+  // delegation instead of a direct reference a re-render would orphan.
+  document.addEventListener('click', (e) => {
+    if (e.target.closest?.('#login-tos-link')) {
+      e.preventDefault();
+      eulaModal.style.display = 'flex';
+    }
   });
 
   eulaAcceptBtn.addEventListener('click', () => {
@@ -154,6 +256,7 @@
   const ssoForm = document.getElementById('sso-form');
   const totpForm = document.getElementById('totp-form');
   const forcedChangeForm = document.getElementById('forced-change-form');
+  const banAppealForm = document.getElementById('ban-appeal-form');
   const errorEl = document.getElementById('auth-error');
 
   // Pending TOTP challenge state (set after successful password auth)
@@ -162,6 +265,9 @@
   // Holds the temp-pw session token + the password the user typed (which
   // was the temp password). Cleared once the change-password flow completes.
   let _pendingForcedChange = null; // { token, user, originalPassword }
+  // Pending ban appeal (#5457): the credentials the user just proved with a
+  // successful password check, reused to authenticate the appeal submission.
+  let _pendingBanAppeal = null; // { username, password }
 
   function showTotpForm() {
     loginForm.style.display = 'none';
@@ -197,20 +303,59 @@
     hideError();
   }
 
+  // (#5457) Shown when login is rejected because the account is banned. The
+  // reason came back from the server only after the password was verified.
+  function showBanAppeal(username, password, reason) {
+    _pendingBanAppeal = { username, password };
+    loginForm.style.display = 'none';
+    registerForm.style.display = 'none';
+    if (ssoForm) ssoForm.style.display = 'none';
+    totpForm.style.display = 'none';
+    forcedChangeForm.style.display = 'none';
+    document.getElementById('recover-form').style.display = 'none';
+    banAppealForm.style.display = 'flex';
+    document.querySelector('.auth-tabs').style.display = 'none';
+    const reasonEl = document.getElementById('ban-appeal-reason');
+    if (reasonEl) {
+      reasonEl.textContent = reason
+        ? `${t('auth.ban_appeal.reason_prefix')} ${reason}`
+        : t('auth.ban_appeal.no_reason');
+    }
+    document.getElementById('ban-appeal-text').value = '';
+    errorEl.style.color = '';
+    document.getElementById('ban-appeal-text').focus();
+    hideError();
+  }
+
+  // function to swap the active tab and form
+  function showTab(target) {
+    tabs.forEach(t => {
+      t.classList.toggle('active', t.dataset.tab === target);
+    });
+
+    loginForm.style.display = target === 'login' ? 'flex' : 'none';
+    registerForm.style.display = target === 'register' ? 'flex' : 'none';
+    if (ssoForm) ssoForm.style.display = target === 'sso' ? 'flex' : 'none';
+    totpForm.style.display = 'none';
+    document.getElementById('recover-form').style.display = 'none';
+    // The age / ToS checkboxes are only for creating an account, so they show on
+    // the register and SSO tabs and stay hidden on login (where the consent note
+    // under the button covers re-affirmation). The guest flow re-shows them.
+    if (eulaNotice) eulaNotice.style.display = (target === 'login') ? 'none' : '';
+    hideError();
+  }
+
+  // listen for clicks on the login tabs to swap the tab and form
   tabs.forEach(tab => {
     tab.addEventListener('click', () => {
-      tabs.forEach(t => t.classList.remove('active'));
-      tab.classList.add('active');
-
-      const target = tab.dataset.tab;
-      loginForm.style.display = target === 'login' ? 'flex' : 'none';
-      registerForm.style.display = target === 'register' ? 'flex' : 'none';
-      if (ssoForm) ssoForm.style.display = target === 'sso' ? 'flex' : 'none';
-      totpForm.style.display = 'none';
-      document.getElementById('recover-form').style.display = 'none';
-      hideError();
+      showTab(tab.dataset.tab);
     });
   });
+
+  // Switch to registration page if an invite link is detected.
+  if (_pendingInvite) {
+    showTab('register');
+  }
 
   function showError(msg) {
     errorEl.textContent = msg;
@@ -234,19 +379,24 @@
     const username = document.getElementById('login-username').value.trim();
     const password = document.getElementById('login-password').value;
     if (!username || !password) return showError(t('auth.errors.enter_admin_credentials'));
+    const codeInput = document.getElementById('admin-recover-code');
+    const code = codeInput ? codeInput.value.trim() : '';
     try {
       const res = await fetch('/api/auth/admin-recover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username, password, ...(code ? { code } : {}) })
       });
       const data = await res.json();
+      // An account with two-factor on asks for its code here too.
+      if (data && data.needsCode && codeInput) {
+        codeInput.style.display = '';
+        codeInput.focus();
+      }
       if (!res.ok) return showError(data.error || t('auth.errors.recovery_failed'));
-      const e2eWrap = await deriveE2EWrappingKey(password);
-      sessionStorage.setItem('haven_e2e_wrap', e2eWrap);
       localStorage.setItem('haven_token', data.token);
       localStorage.setItem('haven_user', JSON.stringify(data.user));
-      window.location.href = _appUrl;
+      await enterApp(data.user, password);
     } catch {
       showError(t('auth.errors.connection_error'));
     }
@@ -302,7 +452,7 @@
       });
       const data = await res.json();
       if (!res.ok) return showError(data.error || t('auth.errors.recovery_failed'));
-      // Success — go back to login with a success message
+      // Success: go back to login with a success message
       hideRecoverForm();
       showError(t('auth.errors.password_reset_success'));
       document.getElementById('auth-error').style.color = 'var(--success, #2ecc71)';
@@ -316,7 +466,10 @@
   loginForm.addEventListener('submit', async (e) => {
     e.preventDefault();
     hideError();
-    if (!checkEula()) return;
+    // No EULA gate on login: an existing account already accepted at
+    // registration (recorded server-side in eula_acceptances). The consent note
+    // under the button covers re-affirmation of the current terms. The account-
+    // creation flows (register / SSO / guest) still call checkEula().
 
     const username = document.getElementById('login-username').value.trim();
     const password = document.getElementById('login-password').value;
@@ -331,7 +484,14 @@
       });
 
       const data = await res.json();
-      if (!res.ok) return showError(data.error || t('auth.errors.login_failed'));
+      if (!res.ok) {
+        // ── Banned: offer an appeal instead of a dead-end error (#5457) ──
+        if (data.banned) {
+          showBanAppeal(username, password, data.reason);
+          return;
+        }
+        return showError(data.error || t('auth.errors.login_failed'));
+      }
 
       // ── TOTP challenge ──
       if (data.requiresTOTP) {
@@ -347,17 +507,54 @@
         return;
       }
 
-      // Derive E2E wrapping key from password (client-side only, never sent to server)
-      const e2eWrap = await deriveE2EWrappingKey(password);
-      sessionStorage.setItem('haven_e2e_wrap', e2eWrap);
-
       localStorage.setItem('haven_token', data.token);
       localStorage.setItem('haven_user', JSON.stringify(data.user));
       localStorage.setItem('haven_eula_accepted', '2.0');
-      window.location.href = _appUrl;
+      // The E2E key is derived here, client-side, and never sent anywhere.
+      await enterApp(data.user, password);
     } catch (err) {
       showError(t('auth.errors.connection_error'));
     }
+  });
+
+  // ── Ban appeal submit (#5457) ─────────────────────────
+  banAppealForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    hideError();
+    if (!_pendingBanAppeal) return showError(t('auth.errors.session_expired'));
+    const appeal = document.getElementById('ban-appeal-text').value.trim();
+    if (!appeal) return showError(t('auth.ban_appeal.errors.empty'));
+    try {
+      const res = await fetch('/api/auth/ban-appeal', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: _pendingBanAppeal.username,
+          password: _pendingBanAppeal.password,
+          appeal
+        })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return showError(data.error || t('auth.ban_appeal.errors.failed'));
+      _pendingBanAppeal = null;
+      document.getElementById('ban-appeal-text').value = '';
+      document.getElementById('ban-appeal-text').disabled = true;
+      showError(t('auth.ban_appeal.submitted'));
+      errorEl.style.color = 'var(--success, #2ecc71)';
+    } catch (err) {
+      showError(t('auth.errors.connection_error'));
+    }
+  });
+
+  document.getElementById('ban-appeal-back-btn').addEventListener('click', (e) => {
+    e.preventDefault();
+    _pendingBanAppeal = null;
+    banAppealForm.style.display = 'none';
+    document.getElementById('ban-appeal-text').disabled = false;
+    loginForm.style.display = 'flex';
+    document.querySelector('.auth-tabs').style.display = 'flex';
+    errorEl.style.color = '';
+    hideError();
   });
 
   // ── TOTP verification ────────────────────────────────
@@ -387,15 +584,13 @@
         return;
       }
 
-      // Derive E2E wrapping key from the original password
-      const e2eWrap = await deriveE2EWrappingKey(_pendingChallenge.password);
-      sessionStorage.setItem('haven_e2e_wrap', e2eWrap);
-
       localStorage.setItem('haven_token', data.token);
       localStorage.setItem('haven_user', JSON.stringify(data.user));
       localStorage.setItem('haven_eula_accepted', '2.0');
+      // The E2E key comes from the original password.
+      const password = _pendingChallenge.password;
       _pendingChallenge = null;
-      window.location.href = _appUrl;
+      await enterApp(data.user, password);
     } catch (err) {
       showError(t('auth.errors.connection_error'));
     }
@@ -457,8 +652,8 @@
     const useRecall = !!oldPw;
 
     if (!useRecall) {
-      if (!newPw || newPw.length < 8) return showError(t('auth.forced_change.errors.too_short') || 'New password must be at least 8 characters');
-      if (newPw !== confirmPw) return showError(t('auth.forced_change.errors.mismatch') || 'New passwords do not match');
+      if (!newPw || newPw.length < 8) return showError(t('auth.forced_change.errors.too_short'));
+      if (newPw !== confirmPw) return showError(t('auth.forced_change.errors.mismatch'));
     }
 
     try {
@@ -472,7 +667,7 @@
       const data = await res.json();
       if (!res.ok) {
         if (data.code === 'old_password_invalid') {
-          return showError(t('auth.forced_change.errors.old_invalid') || 'Original password did not match');
+          return showError(t('auth.forced_change.errors.old_invalid'));
         }
         return showError(data.error || t('auth.errors.connection_error'));
       }
@@ -482,14 +677,13 @@
       // password remains the wrap key source. preserved=false means the
       // new password is now the wrap key source (DMs unrecoverable).
       const wrapSource = data.preserved ? oldPw : newPw;
-      const e2eWrap = await deriveE2EWrappingKey(wrapSource);
-      sessionStorage.setItem('haven_e2e_wrap', e2eWrap);
 
       localStorage.setItem('haven_token', data.token);
       localStorage.setItem('haven_user', JSON.stringify(data.user));
       localStorage.setItem('haven_eula_accepted', '2.0');
       _pendingForcedChange = null;
-      window.location.href = _appUrl;
+      // A separate encryption passphrase is untouched by the password change.
+      await enterApp(data.user, wrapSource);
     } catch (err) {
       showError(t('auth.errors.connection_error'));
     }
@@ -511,7 +705,7 @@
           }
         }
       }
-    } catch { /* ignore */ }
+    } catch { /* corrupt or blocked storage: no recent servers to suggest */ }
 
     let ssoAuthCode = null;
     let ssoServerUrl = null;
@@ -528,6 +722,19 @@
     const ssoRegisterBtn  = document.getElementById('sso-register-btn');
     const ssoBackBtn      = document.getElementById('sso-back-btn');
     const ssoServerInput  = document.getElementById('sso-server-url');
+    const ssoUsernameInput = document.getElementById('sso-username');
+
+    // Haven usernames are letters, numbers and underscores. A legacy home
+    // server may send a display-name-like value, so fold it into that shape.
+    const normalizeSsoUsername = (value) => {
+      if (typeof value !== 'string') return '';
+      return value
+        .trim()
+        .replace(/[^a-zA-Z0-9_]/g, '_')
+        .replace(/_+/g, '_')
+        .replace(/^_+|_+$/g, '')
+        .slice(0, 20);
+    };
 
     const stopSsoPolling = () => {
       if (ssoPollTimer) {
@@ -549,23 +756,43 @@
       ssoProfileData = profile;
       ssoWaiting = false;
       stopSsoPolling();
-      ssoConnectBtn.textContent = 'Connect';
+      ssoConnectBtn.textContent = t('auth.sso.connect');
       ssoConnectBtn.disabled = false;
 
       const profileUsername = (typeof ssoProfileData.username === 'string' ? ssoProfileData.username.trim() : '');
       const previewName = (typeof ssoProfileData.displayName === 'string' ? ssoProfileData.displayName.trim() : '') || profileUsername;
 
-      if (ssoProfileData.profilePicture) {
-        let src = ssoProfileData.profilePicture;
-        if (src.startsWith('/')) {
-          const base = sourceOrigin || getSsoOrigin();
-          src = base + src;
+      // The picture comes from the other server, so it is never trusted as
+      // markup: only an http(s) URL, or a path on that server, becomes an
+      // <img> built with createElement.
+      let avatarSrc = null;
+      const pic = ssoProfileData.profilePicture;
+      if (typeof pic === 'string' && pic) {
+        const isPath = pic.startsWith('/') && !pic.startsWith('//') && !pic.startsWith('/\\');
+        if (isPath || /^https?:\/\//i.test(pic)) {
+          try {
+            const u = isPath ? new URL(pic, sourceOrigin || getSsoOrigin()) : new URL(pic);
+            if (u.protocol === 'https:' || u.protocol === 'http:') avatarSrc = u.href;
+          } catch (err) {
+            console.warn('[SSO] ignoring unreadable profile picture URL:', err.message);
+          }
         }
-        ssoPreviewAvatar.innerHTML = `<img src="${src}" style="width:100%;height:100%;object-fit:cover" alt="">`;
+      }
+      if (avatarSrc) {
+        const img = document.createElement('img');
+        img.src = avatarSrc;
+        img.alt = '';
+        img.style.cssText = 'width:100%;height:100%;object-fit:cover';
+        ssoPreviewAvatar.replaceChildren(img);
       } else {
         ssoPreviewAvatar.textContent = (previewName || '?')[0].toUpperCase();
       }
-      ssoPreviewUsername.textContent = previewName || '—';
+      ssoPreviewUsername.textContent = previewName || '-';
+      // The imported name may already belong to someone here (#5734), so it
+      // is only a suggestion the person can change.
+      let suggested = normalizeSsoUsername(profileUsername);
+      if (suggested.length < 3) suggested = normalizeSsoUsername(ssoProfileData.displayName);
+      ssoUsernameInput.value = suggested;
 
       ssoStepServer.style.display = 'none';
       ssoStepRegister.style.display = '';
@@ -579,7 +806,7 @@
         if (!res.ok) {
           if (surfaceError && res.status !== 404) {
             const data = await res.json().catch(() => ({}));
-            showError(data.error || 'SSO failed — please try again');
+            showError(data.error || t('auth.sso.failed'));
           }
           return false;
         }
@@ -587,7 +814,7 @@
         applySsoProfile(data, getSsoOrigin());
         return true;
       } catch {
-        if (surfaceError) showError('Could not reach home server — please try again');
+        if (surfaceError) showError(t('auth.sso.unreachable'));
         return false;
       }
     };
@@ -601,17 +828,18 @@
       ssoStepServer.style.display = '';
       ssoStepRegister.style.display = 'none';
       ssoPreviewAvatar.innerHTML = '?';
-      ssoPreviewUsername.textContent = '—';
+      ssoPreviewUsername.textContent = '-';
+      ssoUsernameInput.value = '';
       document.getElementById('sso-password').value = '';
       document.getElementById('sso-confirm').value = '';
       hideError();
     }
 
-    // Step 1 — Connect to home server
+    // Step 1: Connect to home server
     ssoConnectBtn.addEventListener('click', () => {
       hideError();
       let raw = ssoServerInput.value.trim();
-      if (!raw) return showError('Enter the address of your Haven server');
+      if (!raw) return showError(t('auth.sso.enter_address'));
 
       // Normalise the URL
       raw = raw.replace(/\/+$/, '');
@@ -632,7 +860,7 @@
       window.open(consentUrl, '_blank');
 
       ssoWaiting = true;
-      ssoConnectBtn.textContent = 'Waiting for approval…';
+      ssoConnectBtn.textContent = t('auth.sso.waiting');
       ssoConnectBtn.disabled = true;
 
       stopSsoPolling();
@@ -643,9 +871,9 @@
         if (!ssoWaiting) return;
         ssoWaiting = false;
         stopSsoPolling();
-        ssoConnectBtn.textContent = 'Connect';
+        ssoConnectBtn.textContent = t('auth.sso.connect');
         ssoConnectBtn.disabled = false;
-        showError('SSO approval timed out — try connecting again');
+        showError(t('auth.sso.timeout'));
       }, 90000);
     });
 
@@ -669,17 +897,17 @@
       applySsoProfile(data.profile, data.serverOrigin || expectedOrigin);
     });
 
-    // Back button — return to step 1
+    // Back button: return to step 1
     ssoBackBtn.addEventListener('click', (e) => {
       e.preventDefault();
       ssoReset();
     });
 
-    // Step 2 — Register with imported profile
+    // Step 2: Register with imported profile
     ssoRegisterBtn.addEventListener('click', async () => {
       hideError();
       if (!checkEula()) return;
-      if (!ssoProfileData) return showError('Please connect to your home server first');
+      if (!ssoProfileData) return showError(t('auth.sso.connect_first'));
 
       const password = document.getElementById('sso-password').value;
       const confirm  = document.getElementById('sso-confirm').value;
@@ -688,23 +916,10 @@
       if (password.length < 8) return showError(t('auth.errors.password_too_short'));
       if (password !== confirm) return showError(t('auth.errors.passwords_no_match'));
 
-      // Prefer canonical username from SSO payload. If a legacy server sends
-      // display-name-like values, normalize into a valid Haven username.
-      const normalizeUsername = (value) => {
-        if (typeof value !== 'string') return '';
-        return value
-          .trim()
-          .replace(/[^a-zA-Z0-9_]/g, '_')
-          .replace(/_+/g, '_')
-          .replace(/^_+|_+$/g, '')
-          .slice(0, 20);
-      };
-      let registerUsername = normalizeUsername(ssoProfileData.username);
-      if (registerUsername.length < 3) {
-        registerUsername = normalizeUsername(ssoProfileData.displayName);
-      }
-      if (registerUsername.length < 3) {
-        return showError('SSO username is invalid. Please use standard registration.');
+      const registerUsername = ssoUsernameInput.value.trim();
+      if (!/^[a-zA-Z0-9_]{3,20}$/.test(registerUsername)) {
+        ssoUsernameInput.focus();
+        return showError(t('auth.sso.invalid_username'));
       }
 
       // Build the full profile picture URL for the server to download
@@ -712,6 +927,9 @@
       if (profilePicUrl && profilePicUrl.startsWith('/')) {
         profilePicUrl = ssoServerUrl + profilePicUrl;
       }
+
+      const ssoCaptchaToken = _captchaTokenFor('sso');
+      if (ssoCaptchaToken === '') return showError(t('auth.errors.captcha_incomplete'));
 
       try {
         const res = await fetch('/api/auth/register', {
@@ -726,12 +944,21 @@
             // (#5344) Reuse the same token field the standard form uses;
             // when the server requires a token the user will have already
             // typed it in the visible field.
-            registrationToken: (document.getElementById('reg-token')?.value || '').trim()
+            registrationToken: (document.getElementById('reg-token')?.value || '').trim(),
+            captchaToken: ssoCaptchaToken || ''
           })
         });
 
         const data = await res.json();
-        if (!res.ok) return showError(data.error || t('auth.errors.registration_failed'));
+        if (!res.ok) {
+          _resetCaptcha('sso');
+          if (data.code === 'username_unavailable') {
+            ssoUsernameInput.focus();
+            ssoUsernameInput.select();
+            return showError(t('auth.sso.username_unavailable'));
+          }
+          return showError(data.error || t('auth.errors.registration_failed'));
+        }
 
         // Derive E2E wrapping key from password
         const e2eWrap = await deriveE2EWrappingKey(password);
@@ -747,23 +974,82 @@
     });
   }
 
+  // ── Opt-in Turnstile CAPTCHA on registration ──────────
+  // Rendered only when the server reports it enabled. Two widgets: one for the
+  // standard register form, one for the SSO register step (both hit the same
+  // /register endpoint, which enforces the challenge server-side).
+  let _captchaSiteKey = '';
+  let _turnstileMain = null;
+  let _turnstileSso = null;
+
+  function _loadTurnstileScript() {
+    return new Promise((resolve, reject) => {
+      if (window.turnstile) return resolve();
+      let s = document.getElementById('cf-turnstile-script');
+      if (s) { s.addEventListener('load', () => resolve()); s.addEventListener('error', () => reject(new Error('load failed'))); return; }
+      s = document.createElement('script');
+      s.id = 'cf-turnstile-script';
+      s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+      s.async = true; s.defer = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('load failed'));
+      document.head.appendChild(s);
+    });
+  }
+
+  async function _initRegistrationCaptcha(siteKey) {
+    _captchaSiteKey = siteKey;
+    try { await _loadTurnstileScript(); } catch { return; }
+    if (!window.turnstile) return;
+    const mainBox = document.getElementById('reg-captcha');
+    if (mainBox && _turnstileMain === null) {
+      const g = document.getElementById('reg-captcha-group'); if (g) g.style.display = '';
+      _turnstileMain = window.turnstile.render(mainBox, { sitekey: siteKey, theme: 'auto' });
+    }
+    const ssoBox = document.getElementById('sso-captcha');
+    if (ssoBox && _turnstileSso === null) {
+      const g = document.getElementById('sso-captcha-group'); if (g) g.style.display = '';
+      _turnstileSso = window.turnstile.render(ssoBox, { sitekey: siteKey, theme: 'auto' });
+    }
+  }
+
+  // null  = captcha not active (skip it);
+  // ''    = active but the user hasn't solved it yet (block submit);
+  // token = solved (send it).
+  function _captchaTokenFor(which) {
+    if (!_captchaSiteKey || !window.turnstile) return null;
+    const id = which === 'sso' ? _turnstileSso : _turnstileMain;
+    if (id === null || id === undefined) return null;
+    return window.turnstile.getResponse(id) || '';
+  }
+  function _resetCaptcha(which) {
+    if (!window.turnstile) return;
+    const id = which === 'sso' ? _turnstileSso : _turnstileMain;
+    if (id !== null && id !== undefined) { try { window.turnstile.reset(id); } catch { /* widget already removed */ } }
+  }
+
   // ── Register ──────────────────────────────────────────
   // (#5344) If the server requires a registration token, reveal the
-  // token field. Best-effort fetch — if it fails we just leave the
+  // token field. Best-effort fetch: if it fails we just leave the
   // field hidden and the server will reject without the token.
-  (async () => {
+  // field is also hidden if an invite link is used and is allowed to override the token requirement.
+  async function _initRegistrationForm() {
     try {
       const r = await fetch('/api/auth/registration-info');
       if (!r.ok) return;
       const info = await r.json();
-      if (info && info.requiresToken) {
+      if (info && info.requiresToken && (!_pendingInvite || !info.invitesBypassToken)) {
         const grp = document.getElementById('reg-token-group');
         const inp = document.getElementById('reg-token');
         if (grp) grp.style.display = '';
         if (inp) inp.required = true;
       }
-    } catch { /* ignore */ }
-  })();
+      if (info && info.captchaEnabled && info.turnstileSiteKey) {
+        _initRegistrationCaptcha(info.turnstileSiteKey);
+      }
+    } catch (err) { console.warn('[Auth] could not load registration info', err); }
+  }
+  _initRegistrationForm();
 
   registerForm.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -780,15 +1066,39 @@
     if (password !== confirm) return showError(t('auth.errors.passwords_no_match'));
     if (password.length < 8) return showError(t('auth.errors.password_too_short'));
 
+    const captchaToken = _captchaTokenFor('main');
+    if (captchaToken === '') return showError(t('auth.errors.captcha_incomplete'));
+
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password, eulaVersion: '2.0', ageVerified: true, registrationToken })
+        body: JSON.stringify({ username, password, eulaVersion: '2.0', ageVerified: true, registrationToken, inviteCode: _pendingInvite, captchaToken: captchaToken || ''})
       });
 
       const data = await res.json();
-      if (!res.ok) return showError(data.error || t('auth.errors.registration_failed'));
+      if (!res.ok) {
+        _resetCaptcha('main');
+
+        const error = data.error || t('auth.errors.registration_failed');
+
+        // if registration error is due to an invalid invite link, display the invite error and show the registration key field if required.
+        // This allows the user to attempt registration again, with the registration code, or a new invitation link.
+        if (error.toLowerCase().includes('invite link')) {
+          sessionStorage.removeItem('haven_pending_invite');
+          _pendingInvite = '';
+
+          const url = new URL(window.location.href);
+          url.searchParams.delete('invite');
+          window.history.replaceState({}, '', url.pathname + url.search + url.hash);
+          _appUrl = _buildAppUrl();
+
+          await _initRegistrationForm();
+        }
+
+        showError(error);
+        return;
+      }
 
       // Derive E2E wrapping key from password (client-side only, never sent to server)
       const e2eWrap = await deriveE2EWrappingKey(password);
@@ -814,7 +1124,21 @@
         const sec = document.getElementById('guest-login-section');
         if (sec) sec.style.display = '';
       }
-    } catch { /* ignore */ }
+    } catch (err) { console.warn('[Auth] could not check guest access', err); }
+  })();
+
+  // ── (#12) SSO button, only when the server reports OIDC usable ──
+  (async () => {
+    try {
+      const r = await fetch('/api/public-config');
+      if (!r.ok) return;
+      const cfg = await r.json();
+      if (!cfg || !cfg.oidc_enabled) return;
+      const sec = document.getElementById('oidc-login-section');
+      const btn = document.getElementById('oidc-login-btn');
+      if (btn && cfg.oidc_button_label) btn.textContent = cfg.oidc_button_label;
+      if (sec) sec.style.display = '';
+    } catch (err) { console.warn('[Auth] could not check single sign-on', err); }
   })();
 
   const guestShowBtn = document.getElementById('guest-login-show-btn');
@@ -831,6 +1155,9 @@
       const ssoForm = document.getElementById('sso-form');
       if (ssoForm) ssoForm.style.display = 'none';
       guestForm.style.display = '';
+      // Guest creation still requires consent (guest submit calls checkEula), so
+      // the checkboxes hidden on the login tab must reappear here.
+      if (eulaNotice) eulaNotice.style.display = '';
       const u = document.getElementById('guest-username');
       if (u) u.focus();
     });
@@ -841,6 +1168,7 @@
       hideError();
       if (guestForm) guestForm.style.display = 'none';
       if (loginForm) loginForm.style.display = '';
+      if (eulaNotice) eulaNotice.style.display = 'none';
     });
   }
   if (guestForm) {
@@ -849,7 +1177,7 @@
       hideError();
       if (!checkEula()) return;
       const username = document.getElementById('guest-username').value.trim();
-      if (!username) return showError('Please enter a username');
+      if (!username) return showError(t('auth.guest.errors.empty'));
       try {
         const res = await fetch('/api/auth/guest-login', {
           method: 'POST',
@@ -857,7 +1185,7 @@
           body: JSON.stringify({ username, eulaVersion: '2.0', ageVerified: true })
         });
         const data = await res.json();
-        if (!res.ok) return showError(data.error || 'Guest login failed');
+        if (!res.ok) return showError(data.error || t('auth.guest.errors.failed'));
         // Guests have no password, so no E2E wrap key. DM tab is hidden
         // for them on the app side.
         localStorage.setItem('haven_token', data.token);
@@ -868,6 +1196,93 @@
       } catch {
         showError(t('auth.errors.connection_error'));
       }
+    });
+  }
+
+  /* ── SSO / OIDC (#12) ─────────────────────────────────
+     Two halves. The button just leaves for the provider. Coming back, the
+     server has already handed us a session, and the only thing left is the
+     encryption passphrase: an SSO user types no password into Haven, so
+     there is nothing to derive the private-key wrapping key from. We ask for
+     a passphrase, stretch it exactly like a password (same PBKDF2 salt and
+     iteration count), and drop the result into the same sessionStorage slot
+     the password path uses, so everything downstream is unchanged. */
+
+  const OIDC_ERRORS = {
+    cancelled: 'auth.oidc.errors.cancelled',
+    disabled: 'auth.oidc.errors.disabled',
+    no_account: 'auth.oidc.errors.no_account',
+    banned: 'auth.oidc.errors.banned',
+    expired: 'auth.oidc.errors.expired',
+    provider_unreachable: 'auth.oidc.errors.provider_unreachable',
+  };
+  if (_oidcError) showError(t(OIDC_ERRORS[_oidcError] || 'auth.oidc.errors.failed'));
+
+  const oidcBtn = document.getElementById('oidc-login-btn');
+  if (oidcBtn) {
+    oidcBtn.addEventListener('click', () => {
+      oidcBtn.disabled = true;
+      window.location.href = '/api/auth/oidc/start';
+    });
+  }
+
+  // The encryption passphrase step: a setup (with a confirm field) or, when
+  // the key already exists on the server, an unlock. finish(wrapKey) gets
+  // the derived key, or null when the user skips.
+  function showE2EPassStep(unlock, finish, unlockDescKey = 'auth.e2e_pass.unlock_desc') {
+    const passForm = document.getElementById('e2e-pass-form');
+    const passInput = document.getElementById('e2e-pass-input');
+    const confirmGroup = document.getElementById('e2e-pass-confirm-group');
+    const confirmInput = document.getElementById('e2e-pass-confirm');
+    const titleEl = document.getElementById('e2e-pass-title');
+    const blurbEl = document.getElementById('e2e-pass-blurb');
+    const hintEl = document.getElementById('e2e-pass-hint');
+
+    // Hide every other form and show the passphrase step.
+    document.querySelectorAll('.auth-form').forEach(f => { f.style.display = 'none'; });
+    document.querySelector('.auth-tabs')?.style.setProperty('display', 'none');
+    passForm.style.display = 'block';
+
+    // Returning on a second device: the key already exists on the server, so
+    // this is an unlock, not a setup. No confirm field, different wording.
+    if (unlock) {
+      titleEl.textContent = t('auth.e2e_pass.unlock_title');
+      blurbEl.textContent = t(unlockDescKey);
+      hintEl.textContent = t('auth.e2e_pass.unlock_hint');
+      confirmGroup.style.display = 'none';
+      confirmInput.removeAttribute('required');
+      passInput.setAttribute('autocomplete', 'current-password');
+    }
+
+    passForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      hideError();
+      const pass = passInput.value;
+      if (!pass || pass.length < 8) return showError(t('auth.e2e_pass.errors.too_short'));
+      if (!unlock && pass !== confirmInput.value) {
+        return showError(t('auth.e2e_pass.errors.mismatch'));
+      }
+      // Only the derived key is kept. The passphrase itself never leaves this
+      // function, and never goes to the server in any form.
+      finish(await deriveE2EWrappingKey(pass));
+    });
+
+    document.getElementById('e2e-pass-skip').addEventListener('click', (ev) => {
+      ev.preventDefault();
+      // Same state as any auto-login without a password: the app runs, and DMs
+      // stay locked on this device until the passphrase is supplied. Nothing
+      // is generated or overwritten, so no history is lost by skipping.
+      finish(null);
+    });
+  }
+
+  if (_oidcHandoff && _oidcHandoff.token) {
+    showE2EPassStep(!!_oidcHandoff.e2eReady, (wrapKey) => {
+      if (wrapKey) sessionStorage.setItem('haven_e2e_wrap', wrapKey);
+      else sessionStorage.removeItem('haven_e2e_wrap');
+      localStorage.setItem('haven_token', _oidcHandoff.token);
+      localStorage.setItem('haven_user', JSON.stringify(_oidcHandoff.user));
+      window.location.href = _appUrl;
     });
   }
 })();

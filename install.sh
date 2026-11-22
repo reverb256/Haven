@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════
-# Haven — Cross-Platform Installer (Linux / macOS)
+# Haven: Cross-Platform Installer (Linux / macOS)
 # Usage: chmod +x install.sh && ./install.sh
 # ═══════════════════════════════════════════════════════════
 set -e
@@ -16,11 +16,11 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo ""
 echo -e "${GREEN}${BOLD}  ========================================${NC}"
-echo -e "${GREEN}${BOLD}       HAVEN — Installer${NC}"
+echo -e "${GREEN}${BOLD}       HAVEN Installer${NC}"
 echo -e "${GREEN}${BOLD}  ========================================${NC}"
 echo ""
 echo "  Welcome! This will set up your private"
-echo "  chat server. Nothing complicated — just"
+echo "  chat server. Nothing complicated, just"
 echo "  follow the steps in the browser window."
 echo ""
 
@@ -172,9 +172,9 @@ install_node() {
         echo -e "  ${GREEN}[OK] Node.js installed!${NC}"
 
     else
-        # No known package manager — try nvm (no root required, works anywhere)
+        # No known package manager: try nvm (no root required, works anywhere)
         echo -e "  ${YELLOW}No known package manager found.${NC}"
-        echo "  Trying nvm (Node Version Manager) — no root needed."
+        echo "  Trying nvm (Node Version Manager), no root needed."
         echo ""
         export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
         if [ ! -f "$NVM_DIR/nvm.sh" ]; then

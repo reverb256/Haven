@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════════
-// Shippy Container — Haven Mini-Game (External JS for CSP)
+// Shippy Container: Haven Mini-Game (External JS for CSP)
 // ═══════════════════════════════════════════════════════════
 
 // Apply saved theme immediately
 const savedTheme = localStorage.getItem('haven_theme');
 if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
 
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
+  await I18n.init();
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
   const W = canvas.width;
@@ -261,7 +262,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (_useRest) {
-      // Mobile / no opener — submit via REST and fetch leaderboard
+      // Mobile / no opener: submit via REST and fetch leaderboard
       if (_authToken && score > 0) {
         fetch('/api/high-scores', {
           method: 'POST',
@@ -272,7 +273,11 @@ document.addEventListener('DOMContentLoaded', () => {
         requestLeaderboard();
       }
     } else {
-      try { window.opener.postMessage({ type: 'flappy-score', score: score }, '*'); } catch {}
+      try {
+        window.opener.postMessage({ type: 'flappy-score', score: score }, location.origin);
+      } catch (err) {
+        console.warn('[flappy] score not sent, opener gone:', err && err.message);
+      }
       requestLeaderboard();
     }
   }
@@ -288,9 +293,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     try {
       if (window.opener) {
-        window.opener.postMessage({ type: 'get-leaderboard' }, '*');
+        window.opener.postMessage({ type: 'get-leaderboard' }, location.origin);
       }
-    } catch { /* opener closed — try REST */
+    } catch { /* opener closed, try REST */
       fetch('/api/high-scores/flappy').then(r => r.json()).then(d => renderLeaderboard(d.leaderboard)).catch(() => {});
     }
   }
@@ -299,18 +304,36 @@ document.addEventListener('DOMContentLoaded', () => {
     const list = document.getElementById('leaderboard-list');
     if (!list) return;
     if (!data || !data.length) {
-      list.innerHTML = '<p style="font-size:11px;color:var(--text-muted)">No scores yet</p>';
+      list.innerHTML = `<p style="font-size:11px;color:var(--text-muted)">${t('games.flappy.no_scores')}</p>`;
       return;
     }
-    list.innerHTML = data.slice(0, 20).map((s, i) => {
-      const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : (i + 1) + '.';
-      const name = s.username.replace(/[<>&"']/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;',"'":'&#39;'}[c]));
-      return `<div class="lb-row"><span class="lb-rank">${medal}</span><span class="lb-name">${name}</span><span class="lb-score">${s.score}</span></div>`;
-    }).join('');
+    // Built with textContent so a crafted name or score can never become markup.
+    list.textContent = '';
+    data.slice(0, 20).forEach((s, i) => {
+      const row = document.createElement('div');
+      row.className = 'lb-row';
+      const rank = document.createElement('span');
+      rank.className = 'lb-rank';
+      rank.textContent = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : (i + 1) + '.';
+      const name = document.createElement('span');
+      name.className = 'lb-name';
+      name.textContent = String((s && s.username) || '');
+      const sc = document.createElement('span');
+      sc.className = 'lb-score';
+      const n = Number(s && s.score);
+      sc.textContent = Number.isFinite(n) ? String(n) : '0';
+      row.append(rank, name, sc);
+      list.appendChild(row);
+    });
   }
 
   window.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'leaderboard-data') {
+    // Only the Haven window that opened or embeds this game may feed it data.
+    if (e.origin !== location.origin) return;
+    const fromOpener = !!window.opener && e.source === window.opener;
+    const fromParent = window.parent !== window && e.source === window.parent;
+    if (!fromOpener && !fromParent) return;
+    if (e.data && e.data.type === 'leaderboard-data' && Array.isArray(e.data.leaderboard)) {
       renderLeaderboard(e.data.leaderboard);
     }
   });
@@ -335,13 +358,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (state === 'waiting') {
-      drawOverlay('� Shippy Container', 'Click or press Space to start');
+      drawOverlay('🚢 Shippy Container', t('games.flappy.start'));
     } else if (state === 'dead') {
-      drawOverlay('Score: ' + score, 'Click or press Space to retry');
+      drawOverlay(t('games.flappy.score_value', { score }), t('games.flappy.retry'));
       if (score === best && score > 0) {
         ctx.fillStyle = '#ffc107';
         ctx.font = 'bold 18px sans-serif';
-        ctx.fillText('\u2b50 New Best! \u2b50', W / 2, H / 2 + 40);
+        ctx.fillText(t('games.flappy.new_best'), W / 2, H / 2 + 40);
       }
     }
   }

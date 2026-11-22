@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// Haven — Mod Mode (layout customisation) v2
+// Haven: Mod Mode (layout customisation) v2
 // - Sections can live in any drop-capable panel (not just the
 //   left sidebar) or float freely on a dedicated overlay layer.
 // - Panels can be resized and snapped to edges/corners.
@@ -166,7 +166,7 @@ class ModMode {
     this._armFloatLayer();
     document.addEventListener('keydown', this._bound.keydown);
     document.addEventListener('dragend', this._bound.dragEnd);
-    this._showToast('Mod Mode ON \u2014 drag section headers or \u2725 handles to rearrange');
+    this._showToast('Mod Mode ON: drag section headers or ✥ handles to rearrange');
   }
 
   _disable() {
@@ -181,7 +181,7 @@ class ModMode {
     document.removeEventListener('dragend', this._bound.dragEnd);
     this._persistFromDom();
     this._saveState();
-    this._showToast('Mod Mode OFF \u2014 layout saved');
+    this._showToast('Mod Mode OFF, layout saved');
   }
 
   _onBreakpointChange() {
@@ -212,7 +212,7 @@ class ModMode {
     s.addEventListener('dragleave', this._bound.dragLeave);
     s.addEventListener('drop',      this._bound.drop);
     this._injectSectionControls(s);
-    // Make section labels and the drag handle the actual drag sources —
+    // Make section labels and the drag handle the actual drag sources;
     // the section body itself is NOT draggable (prevents scroll conflicts)
     s.querySelectorAll('.section-label').forEach(label => {
       label.setAttribute('draggable', 'true');
@@ -441,7 +441,7 @@ class ModMode {
 
   _armFloatLayer() {
     if (!this.floatLayer) return;
-    // Don't add 'active' here — it enables pointer-events on the full-screen
+    // Don't add 'active' here: it enables pointer-events on the full-screen
     // overlay which blocks all clicks.  Instead, activate only during drags.
     this.floatLayer.addEventListener('dragover', this._bound.floatDrag);
     this.floatLayer.addEventListener('drop', this._bound.floatDrop);

@@ -1,14 +1,22 @@
 # ─────────────────────────────────────────────────────────────
-# Haven — Automatic Docker Image Build & Publish
+# Haven: Automatic Docker Image Build & Publish
 # Triggers on every GitHub Release (tag push).
-# Pushes to GitHub Container Registry (ghcr.io) — free, unlimited
+# Pushes to GitHub Container Registry (ghcr.io): free, unlimited
 # for public repos, no account caps, no manual steps needed.
 #
 # Builds amd64 and arm64 on separate NATIVE runners (no QEMU),
-# pushes each as a digest, then merges into a multi-arch manifest.
+# pushes each as its OWN tag, then merges into a multi-arch manifest.
 # Native builds are required because better-sqlite3 compiles a
-# native C++ addon — QEMU emulation is too resource-constrained
+# native C++ addon, and QEMU emulation is too resource-constrained
 # and causes intermittent SIGILL/OOM failures during npm ci.
+#
+# Each arch is published under a persistent tag (…:<version>-amd64 /
+# …:<version>-arm64) instead of an untagged push-by-digest image. GHCR
+# prunes untagged child manifests, which silently dropped linux/arm64
+# from the multi-arch image starting v3.31.1 (#5439). Tagged images are
+# never treated as untagged, so both arches survive. Referencing those
+# tags in the merge step (instead of an expiring digest artifact) also
+# means a manual re-run of the merge keeps working long after release.
 # ─────────────────────────────────────────────────────────────
 
 name: Docker Publish
@@ -35,15 +43,20 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            arch: arm64
 
     steps:
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
+      - name: Resolve release version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -61,30 +74,18 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
-      - name: Build and push image digest
-        id: build
+      # Push each architecture as its own persistent tag so GHCR never prunes
+      # it as an untagged child manifest (#5439). provenance:false keeps each
+      # arch a clean single-platform manifest for the merge step below.
+      - name: Build and push ${{ matrix.arch }} image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: ${{ matrix.platform }}
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          provenance: false
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}-${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.runner }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
 
   merge:
     name: Merge multi-arch manifest
@@ -98,12 +99,8 @@ jobs:
       - name: Lowercase image name
         run: echo "IMAGE_NAME=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
-      - name: Download digests
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: digest-*
-          merge-multiple: true
+      - name: Resolve release version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -115,19 +112,62 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # :beta follows the newest version of any kind. A stable cut from an
+      # older beta (4.28.0 while 4.29.0-beta.2 is out) or a hotfix on an old
+      # stable must not move it backward (#5867).
+      - name: Decide whether this release is the newest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases" --paginate --jq '.[] | select(.draft | not) | .tag_name' > tags.txt
+          NEWEST=$(python3 - "$VERSION" tags.txt <<'EOF'
+          import re, sys
+          def key(v):
+              m = re.match(r'^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.]+))?$', v.strip())
+              if not m:
+                  return None
+              pre = m.group(4)
+              parts = tuple((0, int(p), '') if p.isdigit() else (1, 0, p) for p in pre.split('.')) if pre else ()
+              return (int(m.group(1)), int(m.group(2)), int(m.group(3)), 0 if pre else 1, parts)
+          mine = key(sys.argv[1])
+          others = [k for k in (key(t) for t in open(sys.argv[2])) if k]
+          print('true' if mine and all(mine >= k for k in others) else 'false')
+          EOF
+          )
+          echo "NEWEST=$NEWEST" >> "$GITHUB_ENV"
+          echo "Newest release of any kind: $NEWEST"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # :latest is the stable channel, so a pre-release never moves it.
+          # :beta is early access: the newest release, pre-release or stable.
+          # (A pre-release only gets {{version}} from the semver patterns.)
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !github.event.release.prerelease }}
+            type=raw,value=beta,enable=${{ env.NEWEST == 'true' }}
 
+      # Combine the two per-arch tags into the public multi-arch tags
+      # (<version>, <major>.<minor>, latest).
       - name: Create and push multi-arch manifest
-        working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}-amd64 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ env.VERSION }}-arm64
+
+      # Confirm the pushed manifest actually advertises BOTH arches, so a
+      # future regression fails loudly here instead of silently shipping a
+      # single-arch image again (#5439).
+      - name: Verify multi-arch manifest
+        run: |
+          echo "Inspecting ${REGISTRY}/${IMAGE_NAME}:${VERSION}"
+          out=$(docker buildx imagetools inspect "${REGISTRY}/${IMAGE_NAME}:${VERSION}")
+          echo "$out"
+          echo "$out" | grep -q "linux/amd64" || { echo "::error::amd64 missing from manifest"; exit 1; }
+          echo "$out" | grep -q "linux/arm64" || { echo "::error::arm64 missing from manifest"; exit 1; }
+          echo "Multi-arch manifest verified: amd64 + arm64 present."

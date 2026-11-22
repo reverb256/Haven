@@ -2,11 +2,19 @@
 
 const bcrypt = require('bcryptjs');
 const { utcStamp, isInt } = require('./helpers');
+const { clearChannelRuntimeState } = require('../channelRotation');
+const { ipBanRefusal } = require('../ipBanGuard');
+const { deletableSql } = require('../protectedMessages');
+const { scrubUserMessages } = require('../scrubMessages');
+
+// A scrub or purge leaves protected messages, and thread heads holding one,
+// as they are (src/protectedMessages.js).
+const SCRUBBABLE = deletableSql('m');
 
 module.exports = function register(socket, ctx) {
   const { io, db, state, userHasPermission, getUserEffectiveLevel,
           emitOnlineUsers, broadcastVoiceUsers, getEnrichedChannels, logAudit,
-          invalidateIpBanCache } = ctx;
+          invalidateIpBanCache, getMentionableChannelMembers, handleVoiceLeave } = ctx;
   const { channelUsers, voiceUsers } = state;
   const _audit = (typeof logAudit === 'function') ? logAudit : () => {};
   const _invalidateIpCache = (typeof invalidateIpBanCache === 'function') ? invalidateIpBanCache : () => {};
@@ -21,8 +29,75 @@ module.exports = function register(socket, ctx) {
     if (_tableExists[table]) db.prepare(sql).run(...params);
   }
 
+  function removeUserFromVoice(userId) {
+    for (const [code, users] of Array.from(voiceUsers.entries())) {
+      const entry = users.get(userId);
+      if (!entry) continue;
+      const pendingKey = `${userId}:${code}`;
+      const pending = state.pendingVoiceLeave?.get(pendingKey);
+      if (pending) {
+        clearTimeout(pending.timer);
+        state.pendingVoiceLeave.delete(pendingKey);
+      }
+      const liveSocket = io.sockets.sockets.get(entry.socketId);
+      const voiceSocket = liveSocket || {
+        id: entry.socketId,
+        user: {
+          id: userId,
+          displayName: entry.username,
+          isBot: !!entry.isBot,
+          webhookId: entry.webhookId,
+        },
+        leave() {},
+      };
+      handleVoiceLeave(voiceSocket, code);
+    }
+  }
+
+  // ── Full account-purge cascade ──────────────────────────
+  // Deletes a user and cleans up / reassigns all of their rows. Caller MUST
+  // wrap this in a db.transaction. Shared by the single delete-user handler
+  // and the bulk-remove-users cleanup tool so both stay in lockstep.
+  // `targetUser` needs { username, display_name }.
+  function purgeUserCascade(uid, targetUser, actorId, scrubMessages, reason) {
+    db.prepare('DELETE FROM reactions WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM mutes WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM bans WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM channel_members WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM user_roles WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM read_positions WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM fcm_tokens WHERE user_id = ?').run(uid);
+    db.prepare('UPDATE pinned_messages SET pinned_by = ? WHERE pinned_by = ?').run(actorId, uid);
+    db.prepare('DELETE FROM high_scores WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM eula_acceptances WHERE user_id = ?').run(uid);
+    db.prepare('DELETE FROM user_preferences WHERE user_id = ?').run(uid);
+    updateIfTableExists('user_connections', 'DELETE FROM user_connections WHERE user_id = ?', uid);
+    try { ctx.state?.activity?.clearUser(uid); } catch { /* presence is best-effort */ }
+    db.prepare('UPDATE channels SET created_by = NULL WHERE created_by = ?').run(uid);
+    updateIfTableExists('uploads', 'UPDATE uploads SET uploaded_by = NULL WHERE uploaded_by = ?', uid);
+    updateIfTableExists('channel_emojis', 'UPDATE channel_emojis SET uploaded_by = NULL WHERE uploaded_by = ?', uid);
+    db.prepare('UPDATE bans SET banned_by = ? WHERE banned_by = ?').run(actorId, uid);
+    db.prepare('UPDATE mutes SET muted_by = ? WHERE muted_by = ?').run(actorId, uid);
+    db.prepare('UPDATE user_roles SET granted_by = NULL WHERE granted_by = ?').run(uid);
+    updateIfTableExists('webhook_configs', 'UPDATE webhook_configs SET created_by = NULL WHERE created_by = ?', uid);
+    db.prepare('UPDATE whitelist SET added_by = NULL WHERE added_by = ?').run(uid);
+    db.prepare('UPDATE deleted_users SET deleted_by = NULL WHERE deleted_by = ?').run(uid);
+    if (scrubMessages) {
+      db.prepare(`DELETE FROM pinned_messages WHERE message_id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE})`).run(uid);
+      db.prepare(`DELETE FROM messages WHERE id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE})`).run(uid);
+      db.prepare('UPDATE messages SET user_id = NULL WHERE user_id = ?').run(uid);
+    } else {
+      db.prepare('UPDATE messages SET user_id = NULL WHERE user_id = ?').run(uid);
+    }
+    db.prepare('DELETE FROM users WHERE id = ?').run(uid);
+    db.prepare('INSERT INTO deleted_users (username, display_name, reason, deleted_by) VALUES (?, ?, ?, ?)').run(
+      targetUser.username, targetUser.display_name, reason || '', actorId
+    );
+  }
+
   // ── Kick user ───────────────────────────────────────────
-  socket.on('kick-user', (data) => {
+  socket.on('kick-user', async (data) => {
     if (!data || typeof data !== 'object') return;
     const kickCode = socket.currentChannel;
     const kickCh = kickCode ? db.prepare('SELECT id FROM channels WHERE code = ?').get(kickCode) : null;
@@ -32,6 +107,16 @@ module.exports = function register(socket, ctx) {
     if (!isInt(data.userId)) return;
     if (data.userId === socket.user.id) {
       return socket.emit('error-msg', 'You can\'t kick yourself');
+    }
+    // A one to one DM belongs to its two people: nobody kicks from it. A
+    // moderator who is not the admin kicks only from a channel they are in.
+    if (kickCh) {
+      const kc = db.prepare('SELECT is_dm, is_group, role_gate FROM channels WHERE id = ?').get(kickCh.id);
+      if (kc && kc.is_dm && !kc.is_group) return socket.emit('error-msg', 'You can\'t kick someone from a DM');
+      if (!socket.user.isAdmin && (!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(kickCh.id, socket.user.id)
+          || (kc && !kc.is_dm && !ctx.roleGateAllows(socket.user.id, { id: kickCh.id, role_gate: kc.role_gate })))) {
+        return socket.emit('error-msg', 'You can only kick from a channel you are in');
+      }
     }
 
     if (!socket.user.isAdmin) {
@@ -45,68 +130,134 @@ module.exports = function register(socket, ctx) {
     const code = socket.currentChannel;
     if (!code) return;
 
+    // Kicking is a membership change, so a member who is away can be kicked
+    // the same as one who is here. Only the live parts (the kicked notice,
+    // the socket rooms, the online list) need a connection to exist.
+    const targetUser = db.prepare('SELECT id, username, display_name FROM users WHERE id = ?').get(data.userId);
+    if (!targetUser) return socket.emit('error-msg', 'User not found');
     const channelRoom = channelUsers.get(code);
     const targetInfo = channelRoom ? channelRoom.get(data.userId) : null;
-    if (!targetInfo) {
-      return socket.emit('error-msg', 'User is not currently online in this channel (use ban instead)');
+    const isMember = kickCh ? !!db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(kickCh.id, data.userId) : false;
+    if (!targetInfo && !isMember) {
+      return socket.emit('error-msg', 'User is not in this channel');
     }
-
-    if (kickCh) {
-      db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?').run(kickCh.id, data.userId);
-      const subs = db.prepare('SELECT id FROM channels WHERE parent_channel_id = ?').all(kickCh.id);
-      const delSub = db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?');
-      subs.forEach(s => delSub.run(s.id, data.userId));
-    }
-
-    io.to(targetInfo.socketId).emit('kicked', {
-      channelCode: code,
-      reason: typeof data.reason === 'string' ? data.reason.trim().slice(0, 200) : ''
-    });
-
+    const targetName = targetInfo ? targetInfo.username : (targetUser.display_name || targetUser.username);
+    const kickReason = typeof data.reason === 'string' ? data.reason.trim().slice(0, 200) : '';
     const targetSockets = [...io.sockets.sockets.values()].filter(s => s.user && s.user.id === data.userId);
-    for (const ts of targetSockets) {
-      ts.leave(`channel:${code}`);
+
+    // A group DM is encrypted with a key every member holds, so a kick there
+    // is the same as leaving it: the kicked person loses the group on every
+    // device at once, and the members still in it are told, which makes them
+    // replace the key the kicked person has. (#5740)
+    const groupKick = !!(kickCh && isMember && typeof ctx.leaveGroupDm === 'function'
+      && db.prepare('SELECT 1 FROM channels WHERE id = ? AND is_dm = 1 AND is_group = 1').get(kickCh.id));
+
+    if (groupKick) {
+      // Told first, while their app still knows the group's name.
+      for (const ts of targetSockets) ts.emit('kicked', { channelCode: code, group: true, reason: kickReason });
+      await ctx.leaveGroupDm(code, data.userId, []);
+    } else {
       if (kickCh) {
-        const subs = db.prepare('SELECT code FROM channels WHERE parent_channel_id = ?').all(kickCh.id);
-        subs.forEach(sub => ts.leave(`channel:${sub.code}`));
+        db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?').run(kickCh.id, data.userId);
+        const subs = db.prepare('SELECT id FROM channels WHERE parent_channel_id = ?').all(kickCh.id);
+        const delSub = db.prepare('DELETE FROM channel_members WHERE channel_id = ? AND user_id = ?');
+        subs.forEach(s => delSub.run(s.id, data.userId));
+        // Roles they held in that channel go too.
+        const delScoped = db.prepare('DELETE FROM user_roles WHERE user_id = ? AND channel_id = ?');
+        [kickCh.id, ...subs.map(s => s.id)].forEach(id => delScoped.run(data.userId, id));
       }
-      ts.emit('channels-list', getEnrichedChannels(data.userId, false, (room) => ts.join(room)));
+
+      if (targetInfo) {
+        io.to(targetInfo.socketId).emit('kicked', { channelCode: code, reason: kickReason });
+      }
+
+      // Out of the call as well as the chat, before the code rotates below:
+      // someone still in the voice room would be handed the new code.
+      const subCodes = kickCh ? db.prepare('SELECT code FROM channels WHERE parent_channel_id = ?').all(kickCh.id).map(r => r.code) : [];
+      ctx.liveAccess?.cutOff(data.userId, [code, ...subCodes], 'You were kicked from this channel');
+
+      for (const ts of targetSockets) {
+        if (ts.currentChannel === code) ts.currentChannel = null;
+        ts.leave(`channel:${code}`);
+        if (kickCh) {
+          const subs = db.prepare('SELECT code FROM channels WHERE parent_channel_id = ?').all(kickCh.id);
+          subs.forEach(sub => ts.leave(`channel:${sub.code}`));
+        }
+        ts.emit('channels-list', getEnrichedChannels(data.userId, false, (room) => ts.join(room)));
+      }
     }
 
-    channelRoom.delete(data.userId);
-
-    const online = Array.from(channelRoom.values()).map(u => ({
-      id: u.id, username: u.username
-    }));
-    io.to(`channel:${code}`).emit('online-users', {
-      channelCode: code,
-      users: online
-    });
+    if (channelRoom) {
+      channelRoom.delete(data.userId);
+      const online = Array.from(channelRoom.values()).map(u => ({
+        id: u.id, username: u.username
+      }));
+      io.to(`channel:${code}`).emit('online-users', {
+        channelCode: code,
+        users: online
+      });
+    }
 
     io.to(`channel:${code}`).emit('new-message', {
       channelCode: code,
       message: {
-        id: 0, content: `${targetInfo.username} was kicked`, created_at: new Date().toISOString(),
+        id: 0, content: `${targetName} was kicked`, created_at: new Date().toISOString(),
         username: 'System', user_id: 0, reply_to: null, replyContext: null, reactions: [], edited_at: null, system: true
       }
     });
 
-    if (data.scrubMessages) {
-      const scrubScope = (socket.user.isAdmin && data.scrubScope === 'server') ? 'server' : 'channel';
-      if (scrubScope === 'channel' && kickCh) {
-        db.prepare('DELETE FROM reactions WHERE user_id = ? AND message_id IN (SELECT id FROM messages WHERE channel_id = ? AND is_archived = 0)').run(data.userId, kickCh.id);
-        db.prepare('DELETE FROM messages WHERE user_id = ? AND channel_id = ? AND is_archived = 0').run(data.userId, kickCh.id);
-      } else if (scrubScope === 'server') {
-        db.prepare('DELETE FROM reactions WHERE user_id = ? AND message_id IN (SELECT id FROM messages WHERE user_id = ? AND is_archived = 0)').run(data.userId, data.userId);
-        db.prepare('DELETE FROM messages WHERE user_id = ? AND is_archived = 0').run(data.userId);
+    // Only an admin can scrub server-wide; anyone else's request covers this
+    // channel. The audit log records the scope that was used, not the one asked for.
+    const scrubScope = data.scrubMessages ? ((socket.user.isAdmin && data.scrubScope === 'server') ? 'server' : 'channel') : null;
+    let scrubbed = 0;
+    if (scrubScope === 'server' || (scrubScope === 'channel' && kickCh)) {
+      try {
+        scrubbed = (await scrubUserMessages({ db, io }, data.userId, { channelId: scrubScope === 'channel' ? kickCh.id : null })).deleted;
+      } catch (err) {
+        console.error('Kick scrub failed:', err);
+        socket.emit('error-msg', 'Kicked, but their messages could not all be removed');
       }
     }
 
-    socket.emit('error-msg', `Kicked ${targetInfo.username}`);
+    socket.emit('toast', { message: scrubbed ? `Kicked ${targetName} and removed ${scrubbed} message${scrubbed === 1 ? '' : 's'}` : `Kicked ${targetName}`, type: 'success' });
     _audit({ actor: socket.user, action: 'user_kick',
-      target_type: 'user', target_id: data.userId, target_name: targetInfo.username,
+      target_type: 'user', target_id: data.userId, target_name: targetName,
       details: { channelCode: code, reason: data.reason || null,
-        scrubMessages: !!data.scrubMessages, scrubScope: data.scrubScope || null } });
+        scrubMessages: !!data.scrubMessages, scrubScope, scrubbed } });
+    // Last, since everything above still addresses the channel by its old
+    // code: a kicked person must not be able to walk back into a private
+    // channel with the code they already know.
+    if (kickCh && typeof ctx.rotatePrivateCodesAfterRemoval === 'function') ctx.rotatePrivateCodesAfterRemoval(kickCh.id);
+  });
+
+  // ── Scrub a banned person's messages ────────────────────
+  // From the banned list, for a ban made without "Scrub messages". It takes
+  // what the ban's own scrub would have: everything they wrote in the
+  // server's channels, protected messages and DMs aside. Only for someone
+  // who is banned, by someone who may ban, and never past their own rank.
+  socket.on('scrub-user-messages', async (data, callback) => {
+    const cb = typeof callback === 'function' ? callback : () => {};
+    if (!data || typeof data !== 'object' || !isInt(data.userId)) return cb({ error: 'Invalid request' });
+    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'ban_user')) {
+      return cb({ error: 'You don\'t have permission to remove their messages' });
+    }
+    const target = db.prepare('SELECT id, username, is_admin FROM users WHERE id = ?').get(data.userId);
+    if (!target) return cb({ error: 'User not found' });
+    if (!db.prepare('SELECT 1 FROM bans WHERE user_id = ?').get(target.id)) {
+      return cb({ error: 'Only a banned member\'s messages can be removed from here' });
+    }
+    if (!socket.user.isAdmin && (target.is_admin || getUserEffectiveLevel(target.id) >= getUserEffectiveLevel(socket.user.id))) {
+      return cb({ error: 'You can\'t do that to someone of equal or higher rank' });
+    }
+    try {
+      const r = await scrubUserMessages({ db, io }, target.id);
+      _audit({ actor: socket.user, action: 'user_scrub', target_type: 'user', target_id: target.id,
+        target_name: target.username, details: { deleted: r.deleted, channels: r.channels } });
+      cb({ ok: true, deleted: r.deleted });
+    } catch (err) {
+      console.error('Scrub messages failed:', err);
+      cb({ error: 'Failed to remove their messages' });
+    }
   });
 
   // ── Ban user ────────────────────────────────────────────
@@ -158,9 +309,34 @@ module.exports = function register(socket, ctx) {
       emitOnlineUsers(code);
     }
 
+    // Clients cache the member list per channel and only refetch on a channel
+    // switch, so without this push the banned name stayed in @mention
+    // autocomplete for everyone already sitting in the channel. The list is
+    // identical for every viewer, so one query per channel covers the room.
+    try {
+      const affected = db.prepare(`
+        SELECT c.id, c.code FROM channel_members cm
+        JOIN channels c ON c.id = cm.channel_id
+        WHERE cm.user_id = ? AND c.is_dm = 0
+      `).all(data.userId);
+      for (const ch of affected) {
+        io.to(`channel:${ch.code}`).emit('channel-members', {
+          channelCode: ch.code,
+          members: getMentionableChannelMembers(ch.id)
+        });
+      }
+    } catch (err) {
+      console.warn('[ban] member list refresh failed:', err.message);
+    }
+
+    // A ban clears what they said in the server's channels. Their DMs and
+    // group DMs belong to the people they talked with, and stay.
     if (data.scrubMessages) {
-      db.prepare('DELETE FROM reactions WHERE user_id = ? AND message_id IN (SELECT id FROM messages WHERE user_id = ? AND is_archived = 0)').run(data.userId, data.userId);
-      db.prepare('DELETE FROM messages WHERE user_id = ? AND is_archived = 0').run(data.userId);
+      // The rows go before this returns; the files and the notices follow.
+      scrubUserMessages({ db, io }, data.userId).catch((err) => {
+        console.error('Ban scrub failed:', err);
+        socket.emit('error-msg', 'Banned, but their messages could not all be removed');
+      });
     } else if (data.purgeMessages) {
       // Replace the user's messages with a placeholder rather than deleting
       // them. Useful when admins want a visible "this user was banned"
@@ -172,19 +348,19 @@ module.exports = function register(socket, ctx) {
       const affectedChannels = db.prepare(
         `SELECT DISTINCT c.code FROM messages m
          JOIN channels c ON c.id = m.channel_id
-         WHERE m.user_id = ? AND m.is_archived = 0`
+         WHERE m.user_id = ? AND ${SCRUBBABLE} AND c.is_dm = 0`
       ).all(data.userId).map(r => r.code);
       // Drop reactions tied to the purged messages (they no longer make sense
       // with the placeholder body).
       db.prepare(
-        'DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE user_id = ? AND is_archived = 0)'
+        `DELETE FROM reactions WHERE message_id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE} AND m.channel_id IN (SELECT id FROM channels WHERE is_dm = 0))`
       ).run(data.userId);
       // Replace content + clear file metadata so attachments aren't shown.
       // edited_at gets set so the "edited" tag conveys the change.
       db.prepare(
         `UPDATE messages
          SET content = ?, original_name = NULL, edited_at = datetime('now')
-         WHERE user_id = ? AND is_archived = 0`
+         WHERE id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE} AND m.channel_id IN (SELECT id FROM channels WHERE is_dm = 0))`
       ).run(placeholder, data.userId);
       for (const ccode of affectedChannels) {
         io.to(`channel:${ccode}`).emit('user-messages-purged', {
@@ -206,16 +382,26 @@ module.exports = function register(socket, ctx) {
     if (data.banIp) {
       const canBanIp = socket.user.isAdmin || userHasPermission(socket.user.id, 'ban_ip');
       if (!canBanIp) {
-        socket.emit('error-msg', 'IP ban skipped — you don\'t have ban_ip permission');
+        socket.emit('error-msg', 'IP ban skipped: you don\'t have ban_ip permission');
       } else {
         try {
           const ipRows = db.prepare('SELECT ip FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 5').all(data.userId);
           const ipReason = reason ? `[Linked to ${targetUser.username}] ${reason}` : `Linked to ${targetUser.username}`;
           const stmt = db.prepare('INSERT OR REPLACE INTO ip_bans (ip, banned_by, reason) VALUES (?, ?, ?)');
+          // Normalise on the way out: rows written before v3.42.0 may still
+          // hold "::ffff:1.2.3.4", which would be stored as a ban the HTTP
+          // gate never matched.
+          const { normalizeIp } = require('../clientIp');
           let count = 0;
+          const seenIps = new Set();
           for (const r of ipRows) {
-            if (!r.ip) continue;
-            stmt.run(r.ip, socket.user.id, ipReason.slice(0, 200));
+            const norm = normalizeIp(r.ip);
+            if (!norm || seenIps.has(norm)) continue;
+            seenIps.add(norm);
+            // An address the target shares with staff, or with this machine,
+            // stays open: banning it would lock out more than the target.
+            if (_ipBanRefusal(norm)) continue;
+            stmt.run(norm, socket.user.id, ipReason.slice(0, 200));
             count++;
           }
           if (count > 0) {
@@ -238,12 +424,36 @@ module.exports = function register(socket, ctx) {
   // ── Unban user ──────────────────────────────────────────
   socket.on('unban-user', (data) => {
     if (!data || typeof data !== 'object') return;
-    if (!socket.user.isAdmin) {
-      return socket.emit('error-msg', 'Only admins can unban users');
+    // This was admin-only while ban-user, get-bans and dismiss-ban-appeal all
+    // accepted ban_user, so a moderator could ban someone, watch them sit in
+    // the list, reject their appeal, and then be refused the one action that
+    // undoes their own mistake. IP bans have always shared a single permission
+    // for both directions (_canBanIp); user bans now work the same way.
+    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'ban_user')) {
+      return socket.emit('error-msg', 'You don\'t have permission to unban users');
     }
     if (!isInt(data.userId)) return;
 
+    // Mirror the rank guard on ban-user. A moderator can lift a ban they
+    // placed themselves, or one placed by someone below them, but not an
+    // admin's ban or a peer's. Without this, widening the permission would
+    // hand every moderator a quiet way to reverse an admin's decision.
+    if (!socket.user.isAdmin) {
+      const existing = db.prepare('SELECT banned_by FROM bans WHERE user_id = ?').get(data.userId);
+      if (existing && existing.banned_by !== socket.user.id) {
+        const banner = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(existing.banned_by);
+        if (banner && banner.is_admin) {
+          return socket.emit('error-msg', 'You can\'t undo a ban placed by an admin');
+        }
+        if (getUserEffectiveLevel(existing.banned_by) >= getUserEffectiveLevel(socket.user.id)) {
+          return socket.emit('error-msg', 'You can\'t undo a ban placed by someone of equal or higher rank');
+        }
+      }
+    }
+
     db.prepare('DELETE FROM bans WHERE user_id = ?').run(data.userId);
+    // Any appeal is resolved once the ban is lifted (#5457).
+    db.prepare('DELETE FROM ban_appeals WHERE user_id = ?').run(data.userId);
     const targetUser = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(data.userId);
     socket.emit('error-msg', `Unbanned ${targetUser ? targetUser.username : 'user'}`);
     _audit({ actor: socket.user, action: 'user_unban',
@@ -251,10 +461,47 @@ module.exports = function register(socket, ctx) {
       target_name: targetUser ? targetUser.username : null });
 
     const bans = db.prepare(`
-      SELECT b.id, b.user_id, b.reason, b.created_at, COALESCE(u.display_name, u.username) as username
-      FROM bans b JOIN users u ON b.user_id = u.id ORDER BY b.created_at DESC
+      SELECT b.id, b.user_id, b.reason, b.created_at,
+             COALESCE(u.display_name, u.username) as username,
+             ba.appeal as appeal, ba.created_at as appeal_at
+      FROM bans b
+      JOIN users u ON b.user_id = u.id
+      LEFT JOIN ban_appeals ba ON ba.user_id = b.user_id
+      ORDER BY b.created_at DESC
     `).all();
-    bans.forEach(b => { b.created_at = utcStamp(b.created_at); });
+    bans.forEach(b => {
+      b.created_at = utcStamp(b.created_at);
+      if (b.appeal_at) b.appeal_at = utcStamp(b.appeal_at);
+    });
+    socket.emit('ban-list', bans);
+  });
+
+  // ── Dismiss a ban appeal without unbanning (#5457) ──────────
+  // Lets an admin clear an appeal they've reviewed and rejected, so the
+  // Banned Users list stops flagging it, while the ban itself stays.
+  socket.on('dismiss-ban-appeal', (data) => {
+    if (!data || typeof data !== 'object') return;
+    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'ban_user')) {
+      return socket.emit('error-msg', 'You don\'t have permission to review appeals');
+    }
+    if (!isInt(data.userId)) return;
+    db.prepare('DELETE FROM ban_appeals WHERE user_id = ?').run(data.userId);
+    _audit({ actor: socket.user, action: 'ban_appeal_dismiss',
+      target_type: 'user', target_id: data.userId });
+
+    const bans = db.prepare(`
+      SELECT b.id, b.user_id, b.reason, b.created_at,
+             COALESCE(u.display_name, u.username, '[deleted user]') as username,
+             ba.appeal as appeal, ba.created_at as appeal_at
+      FROM bans b
+      LEFT JOIN users u ON b.user_id = u.id
+      LEFT JOIN ban_appeals ba ON ba.user_id = b.user_id
+      ORDER BY b.created_at DESC
+    `).all();
+    bans.forEach(b => {
+      b.created_at = utcStamp(b.created_at);
+      if (b.appeal_at) b.appeal_at = utcStamp(b.appeal_at);
+    });
     socket.emit('ban-list', bans);
   });
 
@@ -287,46 +534,10 @@ module.exports = function register(socket, ctx) {
         emitOnlineUsers(code);
       }
     }
-    for (const [code, users] of voiceUsers) {
-      if (users.has(data.userId)) {
-        users.delete(data.userId);
-        broadcastVoiceUsers(code);
-      }
-    }
+    removeUserFromVoice(data.userId);
 
     const purge = db.transaction((uid) => {
-      db.prepare('DELETE FROM reactions WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM mutes WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM bans WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM channel_members WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM user_roles WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM read_positions WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM fcm_tokens WHERE user_id = ?').run(uid);
-      db.prepare('UPDATE pinned_messages SET pinned_by = ? WHERE pinned_by = ?').run(socket.user.id, uid);
-      db.prepare('DELETE FROM high_scores WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM eula_acceptances WHERE user_id = ?').run(uid);
-      db.prepare('DELETE FROM user_preferences WHERE user_id = ?').run(uid);
-      db.prepare('UPDATE channels SET created_by = NULL WHERE created_by = ?').run(uid);
-      updateIfTableExists('uploads', 'UPDATE uploads SET uploaded_by = NULL WHERE uploaded_by = ?', uid);
-      updateIfTableExists('channel_emojis', 'UPDATE channel_emojis SET uploaded_by = NULL WHERE uploaded_by = ?', uid);
-      db.prepare('UPDATE bans SET banned_by = ? WHERE banned_by = ?').run(socket.user.id, uid);
-      db.prepare('UPDATE mutes SET muted_by = ? WHERE muted_by = ?').run(socket.user.id, uid);
-      db.prepare('UPDATE user_roles SET granted_by = NULL WHERE granted_by = ?').run(uid);
-      updateIfTableExists('webhook_configs', 'UPDATE webhook_configs SET created_by = NULL WHERE created_by = ?', uid);
-      db.prepare('UPDATE whitelist SET added_by = NULL WHERE added_by = ?').run(uid);
-      db.prepare('UPDATE deleted_users SET deleted_by = NULL WHERE deleted_by = ?').run(uid);
-      if (data.scrubMessages) {
-        db.prepare('DELETE FROM pinned_messages WHERE message_id IN (SELECT id FROM messages WHERE user_id = ? AND is_archived = 0)').run(uid);
-        db.prepare('DELETE FROM messages WHERE user_id = ? AND is_archived = 0').run(uid);
-        db.prepare('UPDATE messages SET user_id = NULL WHERE user_id = ?').run(uid);
-      } else {
-        db.prepare('UPDATE messages SET user_id = NULL WHERE user_id = ?').run(uid);
-      }
-      db.prepare('DELETE FROM users WHERE id = ?').run(uid);
-      db.prepare('INSERT INTO deleted_users (username, display_name, reason, deleted_by) VALUES (?, ?, ?, ?)').run(
-        targetUser.username, targetUser.display_name, reason, socket.user.id
-      );
+      purgeUserCascade(uid, targetUser, socket.user.id, data.scrubMessages, reason);
     });
 
     try {
@@ -336,7 +547,10 @@ module.exports = function register(socket, ctx) {
       return socket.emit('error-msg', 'Failed to delete user');
     }
 
-    socket.emit('error-msg', `Deleted user "${targetUser.displayName}" — username is now available`);
+    _audit({ actor: socket.user, action: 'user_delete',
+      target_type: 'user', target_id: targetUser.id, target_name: targetUser.displayName,
+      details: { reason: reason || null, scrubMessages: !!data.scrubMessages } });
+    socket.emit('error-msg', `Deleted user "${targetUser.displayName}". Username is now available`);
 
     for (const [, s] of io.sockets.sockets) {
       if (s.user && s.user.isAdmin) {
@@ -352,6 +566,155 @@ module.exports = function register(socket, ctx) {
     socket.emit('ban-list', bans);
 
     console.log(`🗑️  Admin deleted user "${targetUser.displayName}" (id: ${data.userId})`);
+  });
+
+  // ── Bulk remove users (bot-wave cleanup) ────────────────
+  // Admin-only, two-phase. A PREVIEW (no userIds) filters accounts by join
+  // recency / zero activity / New flag and returns the candidate list with
+  // per-account message counts, so the admin can uncheck any real users the
+  // filter caught. A COMMIT (userIds present) bans + deletes exactly the
+  // accounts the admin kept checked. Both phases ALWAYS exclude admins, the
+  // acting admin, and anyone holding an assigned role; preview requires at
+  // least one filter so it can never sweep the whole table.
+  socket.on('bulk-remove-users', (data, callback) => {
+    const cb = typeof callback === 'function' ? callback : () => {};
+    if (!socket.user.isAdmin) return cb({ error: 'Only admins can bulk-remove users' });
+    if (!data || typeof data !== 'object') return cb({ error: 'Bad request' });
+
+    // ── COMMIT: an explicit, admin-vetted list of user IDs ──
+    if (Array.isArray(data.userIds)) {
+      const requested = [...new Set(data.userIds.filter(x => Number.isInteger(x)))].slice(0, 10000);
+      if (requested.length === 0) return cb({ ok: true, removed: 0, total: 0 });
+      const reason = (typeof data.reason === 'string' && data.reason.trim()) ? data.reason.trim().slice(0, 200) : 'Bulk cleanup';
+
+      // Re-apply the hard exclusions server-side; never trust the client to
+      // have kept staff or the acting admin out of the list. "Staff" means a
+      // deliberately-granted (non-auto-assign) role; the default role every
+      // account gets on registration is auto_assign and must NOT protect a bot.
+      const ph = requested.map(() => '?').join(',');
+      let targets;
+      try {
+        targets = db.prepare(
+          `SELECT u.id, u.username, u.display_name FROM users u
+           WHERE u.id IN (${ph}) AND u.is_admin = 0 AND u.id != ?
+             AND NOT EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id
+                             WHERE ur.user_id = u.id AND r.auto_assign = 0)`
+        ).all(...requested, socket.user.id);
+      } catch (err) {
+        console.error('bulk-remove-users select error:', err);
+        return cb({ error: 'Failed to look up selected accounts' });
+      }
+      if (targets.length === 0) return cb({ ok: true, removed: 0, total: requested.length });
+      const ids = targets.map(t => t.id);
+
+      // Optional IP ban (off by default): a botnet spreads across many
+      // addresses and some may be shared (CGNAT), so this needs ban_ip.
+      let ipBanned = 0;
+      if (data.banIp && (socket.user.isAdmin || userHasPermission(socket.user.id, 'ban_ip'))) {
+        try {
+          const ipStmt = db.prepare('INSERT OR REPLACE INTO ip_bans (ip, banned_by, reason) VALUES (?, ?, ?)');
+          const { normalizeIp, socketClientIp } = require('../clientIp');
+          // A cleaned-up account may share an address (CGNAT, a household)
+          // with staff. Those addresses, this machine and the person running
+          // the cleanup stay open: anyone at moderator level (50) or above,
+          // and for a moderator also anyone at or above their own rank.
+          const guard = {
+            getUserEffectiveLevel,
+            actorId: socket.user.id,
+            actorIp: socketClientIp(socket),
+            protectAdmins: true,
+            protectLevel: socket.user.isAdmin ? 50 : Math.min(50, getUserEffectiveLevel(socket.user.id)),
+          };
+          const banIps = db.transaction((idList) => {
+            const seen = new Set();
+            for (const uid of idList) {
+              for (const r of db.prepare('SELECT ip FROM user_ips WHERE user_id = ? ORDER BY last_seen DESC LIMIT 3').all(uid)) {
+                const norm = normalizeIp(r.ip);
+                if (!norm || seen.has(norm)) continue;
+                seen.add(norm);
+                if (ipBanRefusal(db, norm, guard)) continue;
+                ipStmt.run(norm, socket.user.id, `[Bulk cleanup] ${reason}`.slice(0, 200));
+                ipBanned++;
+              }
+            }
+          });
+          banIps(ids);
+          if (ipBanned > 0) _invalidateIpCache();
+        } catch (err) { console.error('bulk-remove-users IP ban error:', err); }
+      }
+
+      // Kick live sockets and drop them from in-memory presence/voice maps.
+      const idSet = new Set(ids);
+      for (const [, s] of io.sockets.sockets) {
+        if (s.user && idSet.has(s.user.id)) { s.emit('banned', { reason: 'Your account was removed by an admin.' }); s.disconnect(true); }
+      }
+      for (const [code, users] of channelUsers) {
+        let changed = false;
+        for (const uid of ids) if (users.delete(uid)) changed = true;
+        if (changed) emitOnlineUsers(code);
+      }
+      for (const uid of ids) removeUserFromVoice(uid);
+
+      let removed = 0;
+      try {
+        const purgeAll = db.transaction((list) => {
+          for (const t of list) { purgeUserCascade(t.id, { username: t.username, display_name: t.display_name }, socket.user.id, !!data.scrubMessages, reason); removed++; }
+        });
+        purgeAll(targets);
+      } catch (err) {
+        console.error('bulk-remove-users purge error:', err);
+        return cb({ error: `Failed partway: removed ${removed} of ${targets.length}` });
+      }
+
+      _audit({ actor: socket.user, action: 'user_bulk_remove', target_type: 'user', target_id: null, target_name: null,
+        details: { removed, requested: requested.length, ipBanned, scrubMessages: !!data.scrubMessages, reason } });
+      for (const [, s] of io.sockets.sockets) { if (s.user && s.user.isAdmin) s.emit('users-bulk-removed', { removed, ids }); }
+      console.log(`🧹 Admin ${socket.user.username} bulk-removed ${removed} user(s)${ipBanned ? ` and ${ipBanned} IP(s)` : ''}`);
+      return cb({ ok: true, removed, total: requested.length, ipBanned });
+    }
+
+    // ── PREVIEW: filter → candidate list for the checkbox review ──
+    const f = (data.filter && typeof data.filter === 'object') ? data.filter : {};
+    const joinedWithinHours = Number.isFinite(f.joinedWithinHours) && f.joinedWithinHours > 0
+      ? Math.min(Math.floor(f.joinedWithinHours), 24 * 3650) : null;
+    const zeroMessages = f.zeroMessages === true;
+    const newOnly = f.newOnly === true;   // 'New' badge == joined within 7 days
+    if (!joinedWithinHours && !zeroMessages && !newOnly) {
+      return cb({ error: 'Pick at least one filter. Refusing to select every account.' });
+    }
+
+    // Hard exclusions keep staff safe no matter what filters are set. A
+    // deliberately-granted (non-auto-assign) role marks staff; the default role
+    // every account receives on registration is auto_assign and must not shield
+    // a bot from cleanup.
+    const where = [
+      'u.is_admin = 0',
+      'u.id != @actorId',
+      'NOT EXISTS (SELECT 1 FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = u.id AND r.auto_assign = 0)'
+    ];
+    const params = { actorId: socket.user.id };
+    if (joinedWithinHours) { where.push("u.created_at >= datetime('now', @joinWindow)"); params.joinWindow = `-${joinedWithinHours} hours`; }
+    if (newOnly)           where.push("u.created_at >= datetime('now', '-7 days')");
+    if (zeroMessages)      where.push('NOT EXISTS (SELECT 1 FROM messages m WHERE m.user_id = u.id)');
+    const whereSql = where.join(' AND ');
+
+    const PREVIEW_CAP = 2000;
+    let rows, total;
+    try {
+      total = db.prepare(`SELECT COUNT(*) AS c FROM users u WHERE ${whereSql}`).get(params).c;
+      rows = db.prepare(
+        `SELECT u.id, u.username, u.display_name, u.created_at,
+                (SELECT COUNT(*) FROM messages m WHERE m.user_id = u.id) AS msg_count
+         FROM users u WHERE ${whereSql} ORDER BY u.created_at DESC LIMIT ${PREVIEW_CAP}`
+      ).all(params);
+    } catch (err) {
+      console.error('bulk-remove-users preview error:', err);
+      return cb({ error: 'Failed to compute matches' });
+    }
+    return cb({
+      ok: true, total, capped: total > PREVIEW_CAP,
+      users: rows.map(r => ({ id: r.id, username: r.display_name || r.username, createdAt: r.created_at, msgCount: r.msg_count }))
+    });
   });
 
   // ── Self-delete account ─────────────────────────────────
@@ -380,6 +743,7 @@ module.exports = function register(socket, ctx) {
     }
 
     const scrubMessages = !!data.scrubMessages;
+    const deletedDmCodes = [];
 
     for (const [code, users] of channelUsers) {
       if (users.has(uid)) {
@@ -387,12 +751,7 @@ module.exports = function register(socket, ctx) {
         emitOnlineUsers(code);
       }
     }
-    for (const [code, users] of voiceUsers) {
-      if (users.has(uid)) {
-        users.delete(uid);
-        broadcastVoiceUsers(code);
-      }
-    }
+    removeUserFromVoice(uid);
 
     // Helper: run a DELETE/UPDATE only when the target table exists.
     // Self-hosted instances upgraded from older versions may be missing
@@ -413,6 +772,11 @@ module.exports = function register(socket, ctx) {
       _runIfTable('high_scores', 'DELETE FROM high_scores WHERE user_id = ?', uid);
       _runIfTable('eula_acceptances', 'DELETE FROM eula_acceptances WHERE user_id = ?', uid);
       _runIfTable('user_preferences', 'DELETE FROM user_preferences WHERE user_id = ?', uid);
+      // Linked Steam/Spotify accounts carry encrypted OAuth tokens. The FK
+      // cascade would take these anyway, but a deleted account's credentials
+      // are exactly the thing worth removing explicitly rather than trusting
+      // a pragma that a future migration could turn off.
+      _runIfTable('user_connections', 'DELETE FROM user_connections WHERE user_id = ?', uid);
       _runIfTable('push_subscriptions', 'DELETE FROM push_subscriptions WHERE user_id = ?', uid);
       _runIfTable('fcm_tokens', 'DELETE FROM fcm_tokens WHERE user_id = ?', uid);
       _runIfTable('channels', 'UPDATE channels SET created_by = NULL WHERE created_by = ?', uid);
@@ -427,8 +791,8 @@ module.exports = function register(socket, ctx) {
       _runIfTable('pinned_messages', 'UPDATE pinned_messages SET pinned_by = NULL WHERE pinned_by = ?', uid);
 
       if (scrubMessages) {
-        _runIfTable('pinned_messages', 'DELETE FROM pinned_messages WHERE message_id IN (SELECT id FROM messages WHERE user_id = ? AND is_archived = 0)', uid);
-        _runIfTable('messages', 'DELETE FROM messages WHERE user_id = ? AND is_archived = 0', uid);
+        _runIfTable('pinned_messages', `DELETE FROM pinned_messages WHERE message_id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE})`, uid);
+        _runIfTable('messages', `DELETE FROM messages WHERE id IN (SELECT m.id FROM messages m WHERE m.user_id = ? AND ${SCRUBBABLE})`, uid);
         _runIfTable('messages', 'UPDATE messages SET user_id = NULL WHERE user_id = ?', uid);
 
         const dmChannels = db.prepare(`
@@ -442,6 +806,7 @@ module.exports = function register(socket, ctx) {
             db.prepare('DELETE FROM channel_members WHERE channel_id = ?').run(dm.id);
             _runIfTable('read_positions', 'DELETE FROM read_positions WHERE channel_id = ?', dm.id);
             db.prepare('DELETE FROM channels WHERE id = ?').run(dm.id);
+            deletedDmCodes.push(dm.code);
           }
         }
       } else {
@@ -463,6 +828,11 @@ module.exports = function register(socket, ctx) {
       return cb({ error: `Failed to delete account: ${detail}` });
     }
 
+    for (const code of deletedDmCodes) {
+      io.to(`channel:${code}`).to(`voice:${code}`).emit('channel-deleted', { code });
+      clearChannelRuntimeState(state, code);
+    }
+
     console.log(`🗑️  User self-deleted: "${userRow.username}" (id: ${uid}, scrub: ${scrubMessages})`);
     cb({ success: true });
     socket.disconnect(true);
@@ -472,8 +842,11 @@ module.exports = function register(socket, ctx) {
   socket.on('mute-user', (data) => {
     if (!data || typeof data !== 'object') return;
     const muteCode = socket.currentChannel;
-    const muteCh = muteCode ? db.prepare('SELECT id FROM channels WHERE code = ?').get(muteCode) : null;
-    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'mute_user', muteCh ? muteCh.id : null)) {
+    // A mute silences someone in every channel, so it takes mute_user held
+    // server-wide and rank compared server-wide. A channel role (every
+    // channel's creator gets Channel Mod there) used to be enough to mute
+    // anyone ranked below for up to 30 days, everywhere.
+    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'mute_user')) {
       return socket.emit('error-msg', 'You don\'t have permission to mute users');
     }
     if (!isInt(data.userId)) return;
@@ -482,8 +855,8 @@ module.exports = function register(socket, ctx) {
     }
 
     if (!socket.user.isAdmin) {
-      const myLevel = getUserEffectiveLevel(socket.user.id, muteCh ? muteCh.id : null);
-      const targetLevel = getUserEffectiveLevel(data.userId, muteCh ? muteCh.id : null);
+      const myLevel = getUserEffectiveLevel(socket.user.id);
+      const targetLevel = getUserEffectiveLevel(data.userId);
       if (targetLevel >= myLevel) {
         return socket.emit('error-msg', 'You can\'t mute a user with equal or higher rank');
       }
@@ -511,22 +884,44 @@ module.exports = function register(socket, ctx) {
       }
     }
 
-    socket.emit('error-msg', `Muted ${targetUser.username} for ${durationMinutes} min`);
+    socket.emit('error-msg', `Gave ${targetUser.username} a ${durationMinutes} min timeout`);
     _audit({ actor: socket.user, action: 'user_mute',
       target_type: 'user', target_id: data.userId, target_name: targetUser.username,
       details: { durationMinutes, reason, channelCode: muteCode || null } });
   });
 
+  // Anyone who can mute can unmute. Admin-only unmute left a moderator with
+  // mute_user unable to undo their own mute, and nothing in the client ever
+  // sent this event at all, so every mute ran its full timer (#5640).
   socket.on('unmute-user', (data) => {
     if (!data || typeof data !== 'object') return;
-    if (!socket.user.isAdmin) {
-      return socket.emit('error-msg', 'Only admins can unmute users');
+    if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'mute_user')) {
+      return socket.emit('error-msg', 'You don\'t have permission to unmute users');
     }
     if (!isInt(data.userId)) return;
+    // The same rule as lifting a ban: not your own mute, not an admin's, and
+    // not one placed by someone of equal or higher rank.
+    if (!socket.user.isAdmin) {
+      if (data.userId === socket.user.id) return socket.emit('error-msg', 'You can\'t unmute yourself');
+      const myLevel = getUserEffectiveLevel(socket.user.id);
+      const placers = db.prepare("SELECT DISTINCT muted_by FROM mutes WHERE user_id = ? AND expires_at > datetime('now')").all(data.userId);
+      for (const { muted_by: by } of placers) {
+        if (!by || by === socket.user.id) continue;
+        const placer = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(by);
+        if (placer && placer.is_admin) return socket.emit('error-msg', 'You can\'t undo a mute placed by an admin');
+        if (getUserEffectiveLevel(by) >= myLevel) return socket.emit('error-msg', 'You can\'t undo a mute placed by someone of equal or higher rank');
+      }
+    }
 
-    db.prepare('DELETE FROM mutes WHERE user_id = ?').run(data.userId);
     const targetUser = db.prepare('SELECT COALESCE(display_name, username) as username FROM users WHERE id = ?').get(data.userId);
-    socket.emit('error-msg', `Unmuted ${targetUser ? targetUser.username : 'user'}`);
+    if (!targetUser) return socket.emit('error-msg', 'User not found');
+    const wasMuted = db.prepare('SELECT 1 FROM mutes WHERE user_id = ? AND expires_at > datetime(\'now\') LIMIT 1').get(data.userId);
+    db.prepare('DELETE FROM mutes WHERE user_id = ?').run(data.userId);
+    if (!wasMuted) return socket.emit('toast', { message: `${targetUser.username} is not muted`, type: 'info' });
+    for (const [, s] of io.sockets.sockets) {
+      if (s.user && s.user.id === data.userId) s.emit('unmuted', {});
+    }
+    socket.emit('toast', { message: `Unmuted ${targetUser.username}`, type: 'success' });
     _audit({ actor: socket.user, action: 'user_unmute',
       target_type: 'user', target_id: data.userId,
       target_name: targetUser ? targetUser.username : null });
@@ -538,13 +933,21 @@ module.exports = function register(socket, ctx) {
     if (!socket.user.isAdmin && !userHasPermission(socket.user.id, 'ban_user')) {
       return socket.emit('ban-list', []);
     }
-    // LEFT JOIN so bans referencing a since-deleted user still appear
+    // LEFT JOIN so bans referencing a since-deleted user still appear, plus
+    // any pending appeal text for this ban (#5457).
     const bans = db.prepare(`
       SELECT b.id, b.user_id, b.reason, b.created_at,
-             COALESCE(u.display_name, u.username, '[deleted user]') as username
-      FROM bans b LEFT JOIN users u ON b.user_id = u.id ORDER BY b.created_at DESC
+             COALESCE(u.display_name, u.username, '[deleted user]') as username,
+             ba.appeal as appeal, ba.created_at as appeal_at
+      FROM bans b
+      LEFT JOIN users u ON b.user_id = u.id
+      LEFT JOIN ban_appeals ba ON ba.user_id = b.user_id
+      ORDER BY b.created_at DESC
     `).all();
-    bans.forEach(b => { b.created_at = utcStamp(b.created_at); });
+    bans.forEach(b => {
+      b.created_at = utcStamp(b.created_at);
+      if (b.appeal_at) b.appeal_at = utcStamp(b.appeal_at);
+    });
     socket.emit('ban-list', bans);
   });
 
@@ -567,34 +970,73 @@ module.exports = function register(socket, ctx) {
     return socket.user.isAdmin || userHasPermission(socket.user.id, 'ban_ip');
   }
 
-  // Very small IP sanity check. Accepts IPv4 and IPv6 (loose). We don't try
-  // to normalize — exact-string match is enough for v1; CIDR/v6-/64 ranges
-  // are a future enhancement.
-  function _looksLikeIp(s) {
-    if (typeof s !== 'string') return false;
-    s = s.trim();
-    if (!s || s.length > 64) return false;
-    // IPv4
-    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(s)) {
-      return s.split('.').every(o => { const n = Number(o); return n >= 0 && n <= 255; });
+  // Why an IP ban may not go in, or null. A ban that covers this machine, the
+  // person placing it, or anyone ranked at or above them locks out the people
+  // who would have to lift it, and one wide enough (0.0.0.0/0) locked out the
+  // whole server, the admin included. The widest range is /16 (IPv4) or /48
+  // (IPv6) for a moderator and /8 or /32 for the admin.
+  function _ipBanRefusal(entry) {
+    const { socketClientIp, isIPv4 } = require('../clientIp');
+    const slash = entry.indexOf('/');
+    if (slash !== -1) {
+      const v4 = isIPv4(entry.slice(0, slash));
+      const widest = socket.user.isAdmin ? (v4 ? 8 : 32) : (v4 ? 16 : 48);
+      if (parseInt(entry.slice(slash + 1), 10) < widest) {
+        return `That range is too wide. The widest you can ban is /${widest}.`;
+      }
     }
-    // IPv6 (loose — accept anything with a colon and only hex/colon/dot chars)
-    if (s.includes(':') && /^[0-9a-fA-F:.]+$/.test(s)) return true;
-    return false;
+    // Staff who have used an address in the range. The admin may ban anyone
+    // but themselves; a moderator nobody at or above their own rank.
+    return ipBanRefusal(db, entry, {
+      getUserEffectiveLevel,
+      actorId: socket.user.id,
+      actorIp: socketClientIp(socket),
+      protectAdmins: !socket.user.isAdmin,
+      protectLevel: socket.user.isAdmin ? Infinity : getUserEffectiveLevel(socket.user.id),
+    });
+  }
+
+  // Validation and canonicalisation now live in src/clientIp.js so that the
+  // ban gates, the user_ips recorder and this handler all agree on what an
+  // address is. v3.42.0 also accepts CIDR ranges: a single IPv6 subscriber is
+  // routinely handed an entire /64, so banning one address of theirs used to
+  // accomplish nothing at all.
+  const { normalizeIp, isValidIpOrCidr } = require('../clientIp');
+
+  // Preserve the prefix on CIDR input; normalise the address half only.
+  function _canonicalBanEntry(s) {
+    const raw = String(s || '').trim();
+    const slash = raw.indexOf('/');
+    if (slash === -1) return normalizeIp(raw);
+    return normalizeIp(raw.slice(0, slash)) + '/' + parseInt(raw.slice(slash + 1), 10);
   }
 
   socket.on('ban-ip', (data) => {
     if (!data || typeof data !== 'object') return;
     if (!_canBanIp()) return socket.emit('error-msg', 'You don\'t have permission to ban IPs');
-    const ip = (data.ip || '').trim();
-    if (!_looksLikeIp(ip)) return socket.emit('error-msg', 'Invalid IP address');
+    const input = (data.ip || '').trim();
+    if (!isValidIpOrCidr(input)) return socket.emit('error-msg', 'Invalid IP address or CIDR range');
+    const ip = _canonicalBanEntry(input);
+    const refusal = _ipBanRefusal(ip);
+    if (refusal) return socket.emit('error-msg', refusal);
     const reason = typeof data.reason === 'string' ? data.reason.trim().slice(0, 200) : '';
     try {
       db.prepare('INSERT OR REPLACE INTO ip_bans (ip, banned_by, reason) VALUES (?, ?, ?)').run(ip, socket.user.id, reason);
       _invalidateIpCache();
-      // Disconnect any live sockets coming from that IP.
+      // Disconnect any live sockets coming from that address. Compared through
+      // ipMatches so a /64 ban actually sweeps everyone inside it, and so a
+      // ban on "1.2.3.4" still matches the "::ffff:1.2.3.4" a dual-stack
+      // listener reports. The old identity check on handshake.address missed
+      // both cases, leaving banned clients connected until they reloaded.
+      const { ipMatches, socketClientIp } = require('../clientIp');
       for (const [, s] of io.sockets.sockets) {
-        try { if (s.handshake && s.handshake.address === ip) { s.emit('banned', { reason }); s.disconnect(true); } } catch {}
+        try {
+          if (ipMatches(socketClientIp(s), ip)) { s.emit('banned', { reason }); s.disconnect(true); }
+        } catch (err) {
+          // Keep sweeping the rest. This client may stay connected until it
+          // reloads; the ban still blocks its next connection.
+          console.warn('ban-ip: could not check or disconnect a socket:', err.message);
+        }
       }
       socket.emit('error-msg', `Banned IP ${ip}`);
       _audit({ actor: socket.user, action: 'ip_ban',
@@ -609,10 +1051,24 @@ module.exports = function register(socket, ctx) {
   socket.on('unban-ip', (data) => {
     if (!data || typeof data !== 'object') return;
     if (!_canBanIp()) return socket.emit('error-msg', 'You don\'t have permission to unban IPs');
-    const ip = (data.ip || '').trim();
-    if (!ip) return;
+    const raw = (data.ip || '').trim();
+    if (!raw) return;
+    // Try the canonical form first, then the literal string, so entries stored
+    // by older versions (pre-normalisation) can still be lifted from the UI.
+    const ip = _canonicalBanEntry(raw);
+    if (!socket.user.isAdmin) {
+      const placed = db.prepare('SELECT banned_by FROM ip_bans WHERE ip = ? OR ip = ?').get(ip, raw);
+      if (placed && placed.banned_by && placed.banned_by !== socket.user.id) {
+        const banner = db.prepare('SELECT is_admin FROM users WHERE id = ?').get(placed.banned_by);
+        if (banner && banner.is_admin) return socket.emit('error-msg', 'You can\'t undo an IP ban placed by an admin');
+        if (getUserEffectiveLevel(placed.banned_by) >= getUserEffectiveLevel(socket.user.id)) {
+          return socket.emit('error-msg', 'You can\'t undo an IP ban placed by someone of equal or higher rank');
+        }
+      }
+    }
     try {
-      const info = db.prepare('DELETE FROM ip_bans WHERE ip = ?').run(ip);
+      let info = db.prepare('DELETE FROM ip_bans WHERE ip = ?').run(ip);
+      if (info.changes === 0 && raw !== ip) info = db.prepare('DELETE FROM ip_bans WHERE ip = ?').run(raw);
       _invalidateIpCache();
       if (info.changes > 0) {
         socket.emit('error-msg', `Unbanned IP ${ip}`);

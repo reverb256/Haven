@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════
-// Haven — Service Worker for Push Notifications
+// Haven: Service Worker for Push Notifications
 // Handles incoming push events and notification click actions
 // ═══════════════════════════════════════════════════════════
 
@@ -59,7 +59,20 @@ self.addEventListener('notificationclick', (event) => {
   );
 });
 
-// Activate immediately — don't wait for old SW to die
+// Activate immediately; don't wait for old SW to die
 self.addEventListener('activate', (event) => {
   event.waitUntil(clients.claim());
+});
+
+// A client (another open tab/device) marked the channel read: close any of
+// our own push notifications for it so the badge/toast doesn't linger after
+// the message has already been seen elsewhere.
+self.addEventListener('message', (event) => {
+  if (event.data?.type !== 'close-channel-notifications' || !event.data.channelCode) return;
+  const tag = `haven-${event.data.channelCode}`;
+  event.waitUntil(
+    self.registration.getNotifications({ tag }).then((notifications) => {
+      for (const notification of notifications) notification.close();
+    })
+  );
 });

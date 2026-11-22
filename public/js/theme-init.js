@@ -6,13 +6,13 @@
   // (URL bar / keyboard) and then persist that scroll across reloads.
   // That's what made the entire UI appear shifted up after a refresh in
   // issue #5285. Force-reset on every load.
-  try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch(e) {}
+  try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch(e) { /* read-only in some embedded views: the reset below still runs */ }
   function resetDocScroll() {
     try {
       if (window.scrollY || window.scrollX) window.scrollTo(0, 0);
       if (document.documentElement) document.documentElement.scrollTop = 0;
       if (document.body) document.body.scrollTop = 0;
-    } catch(e) {}
+    } catch(e) { /* scroll reset is cosmetic */ }
   }
   resetDocScroll();
   window.addEventListener('load', resetDocScroll);
@@ -22,7 +22,172 @@
     window.visualViewport.addEventListener('resize', resetDocScroll);
     window.visualViewport.addEventListener('scroll', resetDocScroll);
   }
-  var t = localStorage.getItem('haven_theme');
+  // Toggle style (sliders vs classic checkboxes). Applied before first paint
+  // so on/off settings don't render as one shape and then swap to the other.
+  // Sliders are the default, so only an explicit 'box' choice changes it.
+  try {
+    var _ts = localStorage.getItem('haven-toggle-style');
+    document.documentElement.setAttribute('data-toggle-style', _ts === 'box' ? 'box' : 'switch');
+  } catch (e) {
+    document.documentElement.setAttribute('data-toggle-style', 'switch');
+  }
+
+  // Public density state is available before first paint. Layout plugins and
+  // themes can react without reading Haven's private message geometry values.
+  try {
+    var _density = localStorage.getItem('haven-density');
+    if (['compact', 'cozy', 'spacious'].indexOf(_density) < 0) _density = 'cozy';
+    document.documentElement.setAttribute('data-density', _density);
+    document.documentElement.setAttribute('data-haven-density', _density);
+  } catch (e) {
+    document.documentElement.setAttribute('data-density', 'cozy');
+    document.documentElement.setAttribute('data-haven-density', 'cozy');
+  }
+
+ // Apply channel scroll behavior
+  try {
+    var _channelScroll = localStorage.getItem('haven-channel-scroll');
+    if (['separate', 'combined'].indexOf(_channelScroll) < 0) _channelScroll = 'separate';
+    document.documentElement.setAttribute('data-channel-scroll', _channelScroll);
+  } catch (e) {
+    document.documentElement.setAttribute('data-channel-scroll', 'separate');
+  }
+
+  // Apply the saved interface scale before first paint so the UI doesn't render
+  // at 100% and then jump. Mirrors the slider logic in app-media.js and
+  // migrates the retired 4-tier font-size setting.
+  try {
+    var _z = parseInt(localStorage.getItem('haven-zoom'), 10);
+    if (!_z) {
+      var _legacyZoom = { small: 85, normal: 100, large: 118, 'x-large': 138 };
+      _z = _legacyZoom[localStorage.getItem('haven-fontsize')] || 100;
+    }
+    _z = Math.min(150, Math.max(70, _z));
+    document.documentElement.style.setProperty('--ui-scale', _z + '%');
+  } catch (e) { /* storage blocked: keep the 100% scale */ }
+
+  // Accessibility options (Settings > Accessibility). Applied here, before
+  // first paint, for the same reason as the zoom above: bigger text or a
+  // calmer screen has to be there on the first frame, not arrive once
+  // app.js has loaded. The settings page reads and applies through the same
+  // two functions (window.HavenA11y), so there is one copy of the rules.
+  //
+  // Each option is a data- attribute on <html> that the CSS keys off. Reduce
+  // motion is the exception: its pick (system / on / off) is an attribute,
+  // and the result, after asking the OS when the pick is "system", is the
+  // one class every motion rule checks, html.reduce-motion.
+  var A11Y_CHOICES = {
+    lineSpacing: ['normal', 'relaxed', 'loose'],
+    letterSpacing: ['normal', 'wide'],
+    font: ['theme', 'system', 'hyperlegible', 'dyslexic'],
+    motion: ['system', 'on', 'off'],
+    emoji: ['system', 'twemoji']
+  };
+  function _a11yPick(value, list) { return list.indexOf(value) >= 0 ? value : list[0]; }
+  function _readA11y(storage) {
+    var get = function(key) {
+      try { return storage ? storage.getItem(key) : null; } catch (e) { return null; }
+    };
+    var size = parseInt(get('haven-text-size'), 10);
+    return {
+      textSize: size ? Math.min(200, Math.max(80, size)) : 100,
+      lineSpacing: _a11yPick(get('haven-line-spacing'), A11Y_CHOICES.lineSpacing),
+      letterSpacing: _a11yPick(get('haven-letter-spacing'), A11Y_CHOICES.letterSpacing),
+      font: _a11yPick(get('haven-readable-font'), A11Y_CHOICES.font),
+      emoji: _a11yPick(get('haven-emoji-style'), A11Y_CHOICES.emoji),
+      highContrast: get('haven-contrast') === 'high',
+      motion: _a11yPick(get('haven-reduce-motion'), A11Y_CHOICES.motion),
+      underlineLinks: get('haven-underline-links') === '1',
+      largeTargets: get('haven-large-targets') === '1'
+    };
+  }
+  var _motionQuery = null;
+  try { _motionQuery = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null; } catch (e) { /* no media queries: treat the OS as not asking */ }
+  var _a11yState = null;
+  function _applyA11y(prefs) {
+    var root = document.documentElement;
+    root.style.setProperty('--msg-text-scale', String(prefs.textSize / 100));
+    root.setAttribute('data-text-size', String(prefs.textSize));
+    root.setAttribute('data-line-spacing', prefs.lineSpacing);
+    root.setAttribute('data-letter-spacing', prefs.letterSpacing);
+    root.setAttribute('data-readable-font', prefs.font);
+    root.setAttribute('data-emoji-style', prefs.emoji);
+    root.setAttribute('data-contrast', prefs.highContrast ? 'high' : 'normal');
+    root.setAttribute('data-reduce-motion', prefs.motion);
+    root.setAttribute('data-underline-links', prefs.underlineLinks ? 'on' : 'off');
+    root.setAttribute('data-large-targets', prefs.largeTargets ? 'on' : 'off');
+    var reduce = prefs.motion === 'on' || (prefs.motion === 'system' && !!(_motionQuery && _motionQuery.matches));
+    var was = _a11yState ? _a11yState.reduce : null;
+    if (reduce) root.classList.add('reduce-motion');
+    else if (root.classList.remove) root.classList.remove('reduce-motion');
+    _a11yState = { prefs: prefs, reduce: reduce };
+    // Theme effects, animated pictures and the like are JavaScript, so they
+    // hear about a change instead of reading the class on their own schedule.
+    if (was !== null && was !== reduce && typeof CustomEvent === 'function') {
+      document.dispatchEvent(new CustomEvent('haven:reduce-motion-change', { detail: { reduce: reduce } }));
+    }
+    return reduce;
+  }
+  window.HavenA11y = {
+    read: function() {
+      var storage = null;
+      try { storage = typeof localStorage !== 'undefined' ? localStorage : null; } catch (e) { /* blocked: every option at its default */ }
+      return _readA11y(storage);
+    },
+    apply: _applyA11y,
+    reducedMotion: function() { return !!(_a11yState && _a11yState.reduce); }
+  };
+  try { _applyA11y(window.HavenA11y.read()); } catch (e) { /* the page still renders with the theme's own settings */ }
+  // "Follow system" keeps following it while the page is open.
+  if (_motionQuery) {
+    var _onMotionQuery = function() { if (_a11yState) _applyA11y(_a11yState.prefs); };
+    if (_motionQuery.addEventListener) _motionQuery.addEventListener('change', _onMotionQuery);
+    else if (_motionQuery.addListener) _motionQuery.addListener(_onMotionQuery);
+  }
+
+  var _themeCompat = window.HavenThemeCompat;
+  var _safeMode = _themeCompat ? _themeCompat.isSafeMode(window.location) : false;
+  var _resetPending = _themeCompat ? _themeCompat.isResetPending() : false;
+  if (!_themeCompat) {
+    try {
+      var _safeRequest = new URLSearchParams(window.location.search).get('haven-safe-mode');
+      if (_safeRequest === '1') sessionStorage.setItem('haven_safe_mode', '1');
+      if (_safeRequest === '0') sessionStorage.removeItem('haven_safe_mode');
+      _safeMode = _safeRequest === '1'
+        || (_safeRequest !== '0' && sessionStorage.getItem('haven_safe_mode') === '1');
+      _resetPending = sessionStorage.getItem('haven_customizations_reset_pending') === '1';
+    } catch {
+      _safeMode = new URLSearchParams(window.location.search).get('haven-safe-mode') === '1';
+    }
+  }
+  if (_safeMode) document.documentElement.setAttribute('data-haven-safe-mode', '1');
+
+  function _injectEarlyTheme(file, onSettled) {
+    if (document.getElementById('haven-theme-file-early')) {
+      if (onSettled) onSettled();
+      return;
+    }
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = '/themes/' + encodeURIComponent(file);
+    link.id = 'haven-theme-file-early';
+    if (onSettled) {
+      link.onload = onSettled;
+      link.onerror = onSettled;
+    }
+    document.head.appendChild(link);
+  }
+
+  // Safe mode and a pending recovery reset always start from Haven's base
+  // appearance. Preferences stay stored until the user explicitly resets them.
+  var t = (_safeMode || _resetPending) ? 'haven' : localStorage.getItem('haven_theme');
+  // Light or dark native controls (dropdown lists, scrollbars), as theme.js
+  // last measured them, so a light theme's first frame is light too. Haven's
+  // base (safe mode, no theme yet) is dark, the stylesheet default.
+  if (t && t !== 'haven') {
+    var _scheme = localStorage.getItem('haven_color_scheme');
+    if (_scheme === 'light' || _scheme === 'dark') document.documentElement.setAttribute('data-color-scheme', _scheme);
+  }
   if (t) {
     if (t.indexOf('file:') === 0) {
       // File theme: inject the CSS link immediately so the theme applies on
@@ -30,11 +195,36 @@
       // on the app page while waiting for plugin-loader's 500 ms startup
       // delay. The data-theme is set to 'haven' as a stable layout base,
       // matching what applyFileTheme() does when the plugin-loader runs. (#5359)
-      var _fl = document.createElement('link');
-      _fl.rel = 'stylesheet';
-      _fl.href = '/themes/' + t.slice(5);
-      _fl.id = 'haven-theme-file-early';
-      document.head.appendChild(_fl);
+      var _themeFile = t.slice(5);
+      var _cachedTheme = _themeCompat ? _themeCompat.getCachedTheme(_themeFile) : null;
+      if (_cachedTheme && _cachedTheme.compatible) {
+        _injectEarlyTheme(_themeFile);
+      } else {
+        // Validate an uncached theme immediately. Hide the base briefly so a
+        // first load does not flash Haven before the compatible CSS arrives.
+        document.documentElement.setAttribute('data-haven-theme-pending', _themeFile);
+        if (_themeCompat?.fetchThemes && typeof window.fetch === 'function') {
+          document.documentElement.style.setProperty('visibility', 'hidden');
+          var _finishThemeCheck = function() {
+            document.documentElement.removeAttribute('data-haven-theme-pending');
+            document.documentElement.style.removeProperty('visibility');
+          };
+          setTimeout(_finishThemeCheck, 3000);
+          _themeCompat.fetchThemes(window.fetch.bind(window)).then(function(themes) {
+            if (Array.isArray(themes)) {
+              _themeCompat.cacheThemes(themes);
+              var selected = themes.find(function(theme) { return theme?.file === _themeFile; });
+              if (selected && selected.compatible !== false
+                  && selected.compatibility !== 'invalid'
+                  && selected.compatibility !== 'unsupported') {
+                _injectEarlyTheme(_themeFile, _finishThemeCheck);
+                return;
+              }
+            }
+            _finishThemeCheck();
+          });
+        }
+      }
       document.documentElement.setAttribute('data-theme', 'haven');
     } else {
       document.documentElement.setAttribute('data-theme', t);
@@ -48,7 +238,7 @@
   // own --bg-primary and leave large surfaces rendering with a dark color
   // while explicitly-styled chrome (sidebar, channel header) looks correct.
   if (t && t !== 'custom' && t !== 'rgb') {
-    var leakedKeys = ['--accent','--accent-hover','--accent-dim','--accent-glow',
+    var leakedKeys = ['--accent','--accent-text','--accent-hover','--accent-dim','--accent-glow',
       '--bg-primary','--bg-secondary','--bg-tertiary','--bg-hover','--bg-active',
       '--bg-input','--bg-card','--text-primary','--text-secondary','--text-muted',
       '--text-link','--border','--border-light','--success','--danger','--warning',
@@ -57,9 +247,9 @@
       document.documentElement.style.removeProperty(leakedKeys[i]);
     }
   }
-  // Apply effect overlay system (stackable) — always strip theme pseudo-element effects
+  // Apply effect overlay system (stackable); always strip theme pseudo-element effects
   document.documentElement.setAttribute('data-fx-custom', '');
-  var fxRaw = localStorage.getItem('haven_effects') || 'auto';
+  var fxRaw = (_safeMode || _resetPending) ? '[]' : (localStorage.getItem('haven_effects') || 'auto');
   var fxMode;
   try { fxMode = JSON.parse(fxRaw); } catch(e) { fxMode = fxRaw; }
   // Apply CRT class early for scanline var + font (prevents FOUC)
@@ -69,13 +259,32 @@
     var defaults = {matrix:1,fallout:1,ffx:1,ice:1,nord:1,darksouls:1,bloodborne:1,cyberpunk:1,lotr:1,abyss:1,scripture:1,chapel:1,gospel:1};
     if (defaults[t]) fxList = [t];
   }
-  if (fxList.indexOf('crt') >= 0) document.documentElement.classList.add('fx-crt');
+  // Reduced motion runs no theme effects (theme.js applyEffects), CRT included.
+  if (fxList.indexOf('crt') >= 0 && !(_a11yState && _a11yState.reduce)) document.documentElement.classList.add('fx-crt');
+  // Custom and RGB: paint the last palette theme.js showed, light or dark,
+  // so the first frame already has the right colors (#5726). Without one
+  // (the first load after updating), custom is worked out below.
+  var _paletteApplied = false;
+  if (t === 'custom' || t === 'rgb') {
+    try {
+      var _cached = JSON.parse(localStorage.getItem('haven_palette_cache') || 'null');
+      if (_cached && _cached.theme === t && _cached.vars && typeof _cached.vars === 'object') {
+        for (var _k in _cached.vars) {
+          if (/^--[a-z-]+$/.test(_k) && typeof _cached.vars[_k] === 'string') {
+            document.documentElement.style.setProperty(_k, _cached.vars[_k]);
+          }
+        }
+        _paletteApplied = true;
+      }
+    } catch (e) { /* unreadable copy: fall back to working the colors out */ }
+  }
   // Apply custom theme variables if custom theme is active
-  if (t === 'custom') {
+  if (t === 'custom' && !_paletteApplied) {
     try {
       var hsv = JSON.parse(localStorage.getItem('haven_custom_hsv'));
       if (hsv && typeof hsv.h === 'number') {
         var h = hsv.h, s = hsv.s, v = hsv.v;
+        var ac = hsv.a && typeof hsv.a.h === 'number' && typeof hsv.a.s === 'number' && typeof hsv.a.v === 'number' ? hsv.a : hsv;
         function _hsvRgb(h,s,v) {
           h=((h%360)+360)%360; var c=v*s,x=c*(1-Math.abs((h/60)%2-1)),m=v-c,r,g,b;
           if(h<60){r=c;g=x;b=0}else if(h<120){r=x;g=c;b=0}else if(h<180){r=0;g=c;b=x}
@@ -87,10 +296,10 @@
         var vib = s; // vibrancy follows saturation for dramatic bg changes
         var bgSat = 0.05 + vib * 0.30;
         var bdrSat = 0.05 + vib * 0.25;
-        el.style.setProperty('--accent', _hex(h,s,v));
-        el.style.setProperty('--accent-hover', _hex(h,Math.max(s-.15,0),Math.min(v+.15,1)));
-        el.style.setProperty('--accent-dim', _hex(h,Math.min(s+.1,1),Math.max(v-.2,0)));
-        var rgb=_hsvRgb(h,s,v);
+        el.style.setProperty('--accent', _hex(ac.h,ac.s,ac.v));
+        el.style.setProperty('--accent-hover', _hex(ac.h,Math.max(ac.s-.15,0),Math.min(ac.v+.15,1)));
+        el.style.setProperty('--accent-dim', _hex(ac.h,Math.min(ac.s+.1,1),Math.max(ac.v-.2,0)));
+        var rgb=_hsvRgb(ac.h,ac.s,ac.v);
         el.style.setProperty('--accent-glow', 'rgba('+rgb.join(',')+',0.25)');
         el.style.setProperty('--bg-primary', _hex(h,bgSat,0.07+vib*0.03));
         el.style.setProperty('--bg-secondary', _hex(h,bgSat*0.85,0.09+vib*0.04));
@@ -101,9 +310,9 @@
         el.style.setProperty('--bg-card', _hex(h,bgSat*0.85,0.08+vib*0.04));
         el.style.setProperty('--border', _hex(h,bdrSat,0.16+vib*0.06));
         el.style.setProperty('--border-light', _hex(h,bdrSat,0.21+vib*0.06));
-        el.style.setProperty('--text-link', _hex((h+180)%360,.7,.95));
+        el.style.setProperty('--text-link', _hex((ac.h+180)%360,.7,.95));
       }
-    } catch(e) {}
+    } catch(e) { /* corrupt saved colours: keep the base theme */ }
   }
   // RGB theme: set a neutral dark bg immediately; the cycle starts once theme.js loads
   if (t === 'rgb') {
